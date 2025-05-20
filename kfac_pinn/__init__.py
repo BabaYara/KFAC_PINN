@@ -1,11 +1,11 @@
 """KFAC_PINN Package
 
-A simple implementation of the Kronecker-Factored Approximate Curvature (KFAC)
-optimizer for Physics-Informed Neural Networks (PINNs). This package exposes a
-basic optimizer and helper routines built on top of ``jax`` and ``equinox``.
+Implementation of the Kronecker-Factored Approximate Curvature (KFAC)
+optimizer for Physics-Informed Neural Networks (PINNs). The package exposes a
+full optimiser and helper routines built on top of ``jax`` and ``equinox``.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .kfac import KFAC
 from . import pinn
