@@ -12,11 +12,17 @@ Clone the repository and install the requirements:
 pip install -r requirements.txt
 ```
 
+Alternatively install the package in editable mode using `pyproject.toml`:
+
+```bash
+pip install -e .
+```
+
 ## Usage
 
 The package exposes a minimal `KFAC` optimizer, utilities for constructing
-PINNs and a small training loop helper.  See the notebooks in the
-`examples/` directory for demonstrations.
+PINNs, PDE helper functions and a small training loop helper. See the
+notebooks in the `examples/` directory for demonstrations.
 
 ```python
 import jax
@@ -40,8 +46,9 @@ model, state = training.train(model, opt, loss_fn, data, steps=100)
 
 Several example notebooks are provided:
 
-- `examples/basic_pinn.ipynb` – Train a simple PINN solving a Poisson equation.
+- `examples/basic_pinn.ipynb` – Train a 1D Poisson PINN.
 - `examples/custom_network.ipynb` – Demonstrates creating a custom network.
-- `examples/train_poisson.ipynb` – Full PINN training loop using the helper utilities.
+- `examples/train_poisson.ipynb` – Full 1D training loop.
+- `examples/poisson_2d.ipynb` – New example solving a 2D Poisson problem.
 
 Run them with Jupyter to see the optimizer in action.
