@@ -7,5 +7,6 @@ basic optimizer and helper routines built on top of ``jax`` and ``equinox``.
 
 from .kfac import KFAC
 from . import pinn
+from . import training
 
-__all__ = ["KFAC", "pinn"]
+__all__ = ["KFAC", "pinn", "training"]
