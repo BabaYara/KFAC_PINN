@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kfac_pinn"
+version = "0.1.0"
+description = "KFAC optimizer utilities for Physics-Informed Neural Networks"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "jax",
+    "jaxlib",
+    "equinox",
+    "numpy",
+    "matplotlib",
+]
+
+[project.urls]
+homepage = "https://example.com"
