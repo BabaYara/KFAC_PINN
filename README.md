@@ -3,6 +3,10 @@
 A small Python package implementing the Kronecker-Factored Approximate Curvature
 (KFAC) optimizer for Physics-Informed Neural Networks (PINNs). It is built using
 [JAX](https://github.com/google/jax) and [Equinox](https://github.com/patrick-kidger/equinox).
+The optimizer included here is a **minimal diagonal variant** that approximates
+the Fisher information with a running average of squared gradients. It is not a
+full KFAC implementation but is sufficient for the simple PINN demonstrations
+in this repository.
 
 ## Installation
 
@@ -50,6 +54,7 @@ Several example notebooks are provided:
 - `examples/custom_network.ipynb` – Demonstrates creating a custom network.
 - `examples/train_poisson.ipynb` – Full 1D training loop.
 - `examples/poisson_2d.ipynb` – New example solving a 2D Poisson problem.
+- `examples/heat_equation.ipynb` – Basic 1D heat equation demo.
 
 Run them with Jupyter to see the optimizer in action.
 
