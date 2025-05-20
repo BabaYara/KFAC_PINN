@@ -52,3 +52,14 @@ Several example notebooks are provided:
 - `examples/poisson_2d.ipynb` – New example solving a 2D Poisson problem.
 
 Run them with Jupyter to see the optimizer in action.
+
+When opening the notebooks directly inside the `examples/` folder, make sure
+the package can be imported by installing it in editable mode:
+
+```bash
+pip install -e .
+```
+
+The notebooks also include a small snippet that automatically adjusts the
+Python path so they work out-of-the-box when run from the `examples/`
+directory.
