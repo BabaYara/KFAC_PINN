@@ -5,11 +5,12 @@ optimizer for Physics-Informed Neural Networks (PINNs). The package exposes a
 full optimiser and helper routines built on top of ``jax`` and ``equinox``.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .kfac import KFAC
+from .pinn_kfac import PINNKFAC
 from . import pinn
 from . import pdes
 from . import training
 
-__all__ = ["KFAC", "pinn", "pdes", "training", "__version__"]
+__all__ = ["KFAC", "PINNKFAC", "pinn", "pdes", "training", "__version__"]

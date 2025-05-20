@@ -26,19 +26,22 @@ pip install -e .
 
 ## Usage
 
-The package exposes a `KFAC` optimizer along with utilities for constructing
-PINNs, PDE helper functions and a small training loop helper. See the notebooks
-in the `examples/` directory for demonstrations.
+The package exposes two optimizers: a lightweight `KFAC` implementation and
+`PINNKFAC`, which follows Algorithm&nbsp;1 in the accompanying paper and keeps
+separate Kronecker factors for PDE and boundary contributions. In addition the
+package provides utilities for constructing PINNs, PDE helper functions and a
+small training loop helper. See the notebooks in the `examples/` directory for
+demonstrations.
 
 ```python
 import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-from kfac_pinn import KFAC, pinn, training
+from kfac_pinn import PINNKFAC, pinn, training
 
 model = pinn.make_mlp()
-opt = KFAC(lr=1e-2)
+opt = PINNKFAC(lr=1e-2)
 
 def loss_fn(m, x):
     res = pinn.pinn_residual(m, x, lambda x: jnp.zeros_like(x))
