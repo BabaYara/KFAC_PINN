@@ -3,10 +3,12 @@
 A small Python package implementing the Kronecker-Factored Approximate Curvature
 (KFAC) optimizer for Physics-Informed Neural Networks (PINNs). It is built using
 [JAX](https://github.com/google/jax) and [Equinox](https://github.com/patrick-kidger/equinox).
-The optimizer included here is a **minimal diagonal variant** that approximates
-the Fisher information with a running average of squared gradients. It is not a
-full KFAC implementation but is sufficient for the simple PINN demonstrations
-in this repository.
+
+This repository now provides a *full* KFAC implementation for fully connected
+networks built from ``equinox.nn.Linear`` layers. The optimizer maintains
+Kronecker-factored estimates of the curvature matrices for each layer and uses
+them to precondition parameter updates. It is suitable for the PINN examples
+included here as well as more general applications.
 
 ## Installation
 
@@ -24,9 +26,9 @@ pip install -e .
 
 ## Usage
 
-The package exposes a minimal `KFAC` optimizer, utilities for constructing
-PINNs, PDE helper functions and a small training loop helper. See the
-notebooks in the `examples/` directory for demonstrations.
+The package exposes a `KFAC` optimizer along with utilities for constructing
+PINNs, PDE helper functions and a small training loop helper. See the notebooks
+in the `examples/` directory for demonstrations.
 
 ```python
 import jax
@@ -53,8 +55,9 @@ Several example notebooks are provided:
 - `examples/basic_pinn.ipynb` – Train a 1D Poisson PINN.
 - `examples/custom_network.ipynb` – Demonstrates creating a custom network.
 - `examples/train_poisson.ipynb` – Full 1D training loop.
-- `examples/poisson_2d.ipynb` – New example solving a 2D Poisson problem.
+- `examples/poisson_2d.ipynb` – 2D Poisson problem.
 - `examples/heat_equation.ipynb` – Basic 1D heat equation demo.
+- `examples/full_kfac_demo.ipynb` – Demonstrates the full KFAC optimiser.
 
 Run them with Jupyter to see the optimizer in action.
 
