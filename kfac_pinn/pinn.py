@@ -41,4 +41,4 @@ def boundary_loss(model: eqx.Module, points: jnp.ndarray, exact: Callable[[jnp.n
 def interior_loss(model: eqx.Module, points: jnp.ndarray, rhs: Callable[[jnp.ndarray], jnp.ndarray]):
     """Squared residual of the PDE inside the domain."""
     res = jax.vmap(lambda x: pinn_residual(model, x, rhs))(points)
-    return jnp.mean(res ** 2)
+    return jnp.log(jnp.mean(res ** 2))
