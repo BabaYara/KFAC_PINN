@@ -634,6 +634,7 @@ class PINNKFAC(eqx.Module):
         return final_params_pytree, tuple(new_kfac_state_layers_list)
 
 
+    @eqx.filter_jit
     def step(
         self,
         model: eqx.Module,
