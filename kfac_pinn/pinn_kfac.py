@@ -634,6 +634,7 @@ class PINNKFAC(eqx.Module):
         return final_params_pytree, tuple(new_kfac_state_layers_list)
 
 
+    @eqx.filter_jit
     def step(
         self,
         model: eqx.Module,
@@ -877,7 +878,7 @@ def _standard_backward_pass(model: eqx.Module, pre_activations: List[jnp.ndarray
     else:
         g = grad_output
     linear_layer_indices = [i for i, l_obj in enumerate(model.layers) if isinstance(l_obj, eqx.nn.Linear)]
-    for idx_in_model_lists in reversed(range(len(linear_layer_indices)))):
+    for idx_in_model_lists in reversed(range(len(linear_layer_indices))):
         layer_object = _linear_layers(model)[idx_in_model_lists] 
         phi_l = act_derivatives[idx_in_model_lists] 
         g_s_l = g * phi_l 
