@@ -69,6 +69,7 @@ class KFAC(eqx.Module):
     # ------------------------------------------------------------------
     # Core optimisation step
     # ------------------------------------------------------------------
+    @eqx.filter_jit
     def step(
         self,
         model: eqx.Module,
