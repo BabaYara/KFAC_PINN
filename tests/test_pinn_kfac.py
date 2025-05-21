@@ -1,892 +1,378 @@
 import pytest
 import jax
 import jax.numpy as jnp
-import jax.random as jr
+import jax.random as jr 
 import equinox as eqx
-import chex
+from jax.numpy.testing import assert_allclose 
 
-# Imports from kfac_pinn
 from kfac_pinn.pinn_kfac import (
     AugmentedState,
     _propagate_linear_augmented,
     _propagate_activation_augmented,
-    _augmented_forward_cache,
-    LayerFactors, # For PINNKFACState and factor related tests
+    _get_activation_derivatives,
+    LayerFactors, 
     PINNKFACState,
     PINNKFAC,
     _linear_layers,
-    _standard_forward_cache, # For standard_factor_terms test
-    _standard_backward_pass, # For standard_factor_terms test
+    _standard_forward_cache,
+    _standard_backward_pass,
     _augmented_factor_terms,
     compute_gramian_vector_product,
-    tree_dot
+    tree_dot,
+    _augmented_forward_cache
 )
-# Imports from kfac_pinn (specifically functions to be tested)
-from kfac_pinn.pinn_kfac import _get_activation_derivatives
 
-# If pdes.forward_laplacian is needed, it would be:
-# from kfac_pinn.pdes import forward_laplacian
-
-# Seed for reproducibility in tests
 key = jr.PRNGKey(0)
 
-# Helper function for numerical differentiation for comparison
-def numerical_grad(fn, x, eps=1e-4):
-    return (fn(x + eps) - fn(x - eps)) / (2 * eps)
+# Helper function, similar to the one in PINNKFAC.step
+def build_tree_from_parts_for_test(parts_list_local, template_params_local, linear_indices_local):
+    zero_filled_template = jax.tree_map(lambda x: jnp.zeros_like(x) if eqx.is_array(x) else x, template_params_local)
+    current_tree = zero_filled_template
+    
+    if len(parts_list_local) != len(linear_indices_local):
+        raise ValueError(f"Parts list length {len(parts_list_local)} != linear indices length {len(linear_indices_local)}")
 
-class TestGetActivationDerivatives:
+    for k_idx, p_dict in enumerate(parts_list_local):
+        model_l_idx = linear_indices_local[k_idx]
+        
+        if not isinstance(template_params_local.layers[model_l_idx], eqx.nn.Linear):
+             raise ValueError(f"Target layer {model_l_idx} in template is not an eqx.nn.Linear layer.")
+
+        weight_path = lambda tree: tree.layers[model_l_idx].weight
+        bias_path = lambda tree: tree.layers[model_l_idx].bias
+        
+        current_tree = eqx.tree_at(weight_path, current_tree, p_dict['weight'])
+        current_tree = eqx.tree_at(bias_path, current_tree, p_dict['bias'])
+    return current_tree
+
+
+# --- Tests for AugmentedState ---
+def test_augmented_state_from_coords_1d_pde_order_2():
+    coords = jnp.array([[1.0], [2.0], [3.0]]) 
+    batch_size, spatial_dim = coords.shape; pde_order = 2
+    aug_state = AugmentedState.from_coords(coords, pde_order, spatial_dim)
+    assert len(aug_state.taylor_coefficients) == pde_order + 1
+    s0 = aug_state.taylor_coefficients[0]
+    assert s0.shape == (batch_size, 1, spatial_dim) and jnp.allclose(s0, jnp.expand_dims(coords, axis=1))
+    s1 = aug_state.taylor_coefficients[1]
+    assert s1.shape == (batch_size, spatial_dim, spatial_dim) and jnp.allclose(s1, jnp.ones((batch_size, spatial_dim, spatial_dim)))
+    s2 = aug_state.taylor_coefficients[2]
+    assert s2.shape == (batch_size, spatial_dim, spatial_dim) and jnp.allclose(s2, jnp.zeros_like(s2))
+    assert aug_state.num_s_components == 1 + spatial_dim + spatial_dim
+    concatenated = aug_state.concatenate_components()
+    expected_concat_shape = ((1 + spatial_dim + spatial_dim) * batch_size, spatial_dim)
+    assert concatenated.shape == expected_concat_shape
+    s0_r = jnp.reshape(jnp.transpose(s0, (1,0,2)), (s0.shape[1]*batch_size, spatial_dim))
+    s1_r = jnp.reshape(jnp.transpose(s1, (1,0,2)), (s1.shape[1]*batch_size, spatial_dim))
+    s2_r = jnp.reshape(jnp.transpose(s2, (1,0,2)), (s2.shape[1]*batch_size, spatial_dim))
+    expected_concat_vals = jnp.concatenate([s0_r, s1_r, s2_r], axis=0)
+    assert_allclose(concatenated, expected_concat_vals, atol=1e-6)
+
+
+def test_augmented_state_from_coords_2d_pde_order_2():
+    coords = jnp.array([[1.0, 0.5], [2.0, 1.5]]); batch_size, spatial_dim = coords.shape; pde_order = 2
+    aug_state = AugmentedState.from_coords(coords, pde_order, spatial_dim)
+    assert len(aug_state.taylor_coefficients) == pde_order + 1
+    s0 = aug_state.taylor_coefficients[0]
+    assert s0.shape == (batch_size, 1, spatial_dim) and jnp.allclose(s0, jnp.expand_dims(coords, axis=1))
+    s1 = aug_state.taylor_coefficients[1]
+    assert s1.shape == (batch_size, spatial_dim, spatial_dim) and jnp.allclose(s1, jnp.stack([jnp.eye(spatial_dim)] * batch_size))
+    s2 = aug_state.taylor_coefficients[2]
+    assert s2.shape == (batch_size, spatial_dim, spatial_dim) and jnp.allclose(s2, jnp.zeros_like(s2))
+    assert aug_state.num_s_components == 1 + spatial_dim + spatial_dim
+    concatenated = aug_state.concatenate_components()
+    expected_concat_shape = ((1 + spatial_dim + spatial_dim) * batch_size, spatial_dim)
+    assert concatenated.shape == expected_concat_shape
+    s0_r = jnp.reshape(jnp.transpose(s0, (1,0,2)), (s0.shape[1]*batch_size, spatial_dim))
+    s1_r = jnp.reshape(jnp.transpose(s1, (1,0,2)), (s1.shape[1]*batch_size, spatial_dim))
+    s2_r = jnp.reshape(jnp.transpose(s2, (1,0,2)), (s2.shape[1]*batch_size, spatial_dim))
+    expected_concat_vals = jnp.concatenate([s0_r, s1_r, s2_r], axis=0)
+    assert_allclose(concatenated, expected_concat_vals, atol=1e-6)
+
+def test_propagate_linear_augmented():
+    global key; key_layer, key_coords = jr.split(key); batch_size, pde_order = 2, 2
+    in_spatial_dim, out_features_layer = 2, 3 
+    layer = eqx.nn.Linear(in_spatial_dim, out_features_layer, key=key_layer)
+    coords = jr.normal(key_coords, (batch_size, in_spatial_dim))
+    aug_state_in = AugmentedState.from_coords(coords, pde_order, in_spatial_dim)
+    aug_state_out = _propagate_linear_augmented(aug_state_in, layer)
+    W, b = layer.weight, layer.bias 
+    s0_in_squeezed = jnp.squeeze(aug_state_in.taylor_coefficients[0], axis=1)
+    expected_z0_squeezed = s0_in_squeezed @ W.T + b
+    expected_z0 = jnp.expand_dims(expected_z0_squeezed, axis=1)
+    assert_allclose(aug_state_out.taylor_coefficients[0], expected_z0, atol=1e-6)
+    assert aug_state_out.taylor_coefficients[0].shape == (batch_size, 1, out_features_layer)
+    s1_in = aug_state_in.taylor_coefficients[1] 
+    s1_in_reshaped = jnp.reshape(s1_in, (batch_size * s1_in.shape[1], s1_in.shape[2]))
+    expected_z1_reshaped = s1_in_reshaped @ W.T
+    expected_z1 = jnp.reshape(expected_z1_reshaped, (batch_size, s1_in.shape[1], out_features_layer))
+    assert_allclose(aug_state_out.taylor_coefficients[1], expected_z1, atol=1e-6)
+    assert aug_state_out.taylor_coefficients[1].shape == (batch_size, in_spatial_dim, out_features_layer)
+    s2_in = aug_state_in.taylor_coefficients[2] 
+    s2_in_reshaped = jnp.reshape(s2_in, (batch_size * s2_in.shape[1], s2_in.shape[2]))
+    expected_z2_reshaped = s2_in_reshaped @ W.T
+    expected_z2 = jnp.reshape(expected_z2_reshaped, (batch_size, s2_in.shape[1], out_features_layer))
+    assert_allclose(aug_state_out.taylor_coefficients[2], expected_z2, atol=1e-6)
+    assert aug_state_out.taylor_coefficients[2].shape == (batch_size, in_spatial_dim, out_features_layer)
+
+@pytest.mark.parametrize("activation_name, scalar_fn", [
+    ("x_squared", lambda x: x**2), ("tanh", jnp.tanh), ("x_cubed", lambda x: x**3)
+])
+def test_propagate_activation_augmented(activation_name, scalar_fn):
+    global key; key_state_init = jr.PRNGKey(hash(activation_name)) 
+    batch_size, num_features, pde_order, spatial_dim = 2, 3, 2, 2
+    s0 = jr.normal(key_state_init, (batch_size, 1, num_features))
+    s1 = jr.normal(key_state_init, (batch_size, spatial_dim, num_features)) 
+    s2 = jr.normal(key_state_init, (batch_size, spatial_dim, num_features)) 
+    aug_state_in = AugmentedState(taylor_coefficients=[s0, s1, s2])
+    _, grad_fn_scalar, grad_grad_fn_scalar = _get_activation_derivatives(scalar_fn, activation_name)
+    vmap_scalar_fn_batched_features = jax.vmap(jax.vmap(scalar_fn))
+    vmap_grad_fn_batched_features = jax.vmap(jax.vmap(grad_fn_scalar))
+    vmap_grad_grad_fn_batched_features = jax.vmap(jax.vmap(grad_grad_fn_scalar))
+    aug_state_out = _propagate_activation_augmented(
+        aug_state_in, vmap_scalar_fn_batched_features, 
+        vmap_grad_fn_batched_features, vmap_grad_grad_fn_batched_features
+    )
+    s0_squeezed = jnp.squeeze(s0, axis=1) 
+    sigma_s0 = vmap_scalar_fn_batched_features(s0_squeezed)         
+    sigma_prime_s0 = vmap_grad_fn_batched_features(s0_squeezed)  
+    sigma_prime_prime_s0 = vmap_grad_grad_fn_batched_features(s0_squeezed) 
+    expected_z0 = jnp.expand_dims(sigma_s0, axis=1) 
+    assert_allclose(aug_state_out.taylor_coefficients[0], expected_z0, atol=1e-6)
+    sigma_prime_s0_expanded = jnp.expand_dims(sigma_prime_s0, axis=1) 
+    expected_z1 = sigma_prime_s0_expanded * s1 
+    assert_allclose(aug_state_out.taylor_coefficients[1], expected_z1, atol=1e-6)
+    s1_squared = jnp.square(s1) 
+    sigma_prime_prime_s0_expanded = jnp.expand_dims(sigma_prime_prime_s0, axis=1) 
+    term1_z2 = sigma_prime_s0_expanded * s2
+    term2_z2 = 0.5 * sigma_prime_prime_s0_expanded * s1_squared
+    expected_z2 = term1_z2 + term2_z2 
+    assert_allclose(aug_state_out.taylor_coefficients[2], expected_z2, atol=1e-5) 
+    assert aug_state_out.taylor_coefficients[0].shape == s0.shape
+    assert aug_state_out.taylor_coefficients[1].shape == s1.shape
+    assert aug_state_out.taylor_coefficients[2].shape == s2.shape
+
+class TestGetActivationDerivatives: 
     @pytest.mark.parametrize("jax_fn_name, test_points", [
-        ("tanh", [0.0, 0.5, -0.5]),
-        ("relu", [0.0, 0.5, -0.5]), # grad(grad(relu)) is 0 everywhere except undefined at 0 (JAX returns 0 for grad(relu)(0))
-        ("sin", [0.0, jnp.pi/2, -jnp.pi/4]),
+        ("tanh", [0.0, 0.5, -0.5]), ("relu", [0.0, 0.5, -0.5]), ("sin", [0.0, jnp.pi/2, -jnp.pi/4]),
     ])
     def test_common_activators(self, jax_fn_name, test_points):
-        if jax_fn_name == "tanh":
-            act_fn_orig = jnp.tanh
-        elif jax_fn_name == "relu":
-            act_fn_orig = jax.nn.relu
-        elif jax_fn_name == "sin":
-            act_fn_orig = jnp.sin
-        else:
-            raise ValueError("Unsupported function")
-
+        if jax_fn_name == "tanh": act_fn_orig = jnp.tanh
+        elif jax_fn_name == "relu": act_fn_orig = jax.nn.relu
+        elif jax_fn_name == "sin": act_fn_orig = jnp.sin
+        else: raise ValueError("Unsupported function")
         fn, grad_fn, grad_grad_fn = _get_activation_derivatives(act_fn_orig, f"test_{jax_fn_name}")
-
         for x_val_float in test_points:
-            x = jnp.array(x_val_float) # Ensure it's a JAX array for differentiation
-            
-            # Check original function
-            chex.assert_trees_all_close(fn(x), act_fn_orig(x), atol=1e-6, err_msg=f"{jax_fn_name}({x})")
+            x = jnp.array(x_val_float) 
+            assert_allclose(fn(x), act_fn_orig(x), atol=1e-6)
+            assert_allclose(grad_fn(x), jax.grad(act_fn_orig)(x), atol=1e-6)
+            assert_allclose(grad_grad_fn(x), jax.grad(jax.grad(act_fn_orig))(x), atol=1e-6)
 
-            # Check first derivative
-            expected_grad = jax.grad(act_fn_orig)(x)
-            chex.assert_trees_all_close(grad_fn(x), expected_grad, atol=1e-6, err_msg=f"grad_{jax_fn_name}({x})")
-            
-            # Check second derivative
-            expected_grad_grad = jax.grad(jax.grad(act_fn_orig))(x)
-            chex.assert_trees_all_close(grad_grad_fn(x), expected_grad_grad, atol=1e-6, err_msg=f"grad_grad_{jax_fn_name}({x})")
-
-    def test_non_differentiable_function(self):
-        # jnp.sign is complex-valued for derivative, and not JAX-differentiable for floats at 0
-        # _get_activation_derivatives uses jax.eval_shape(..., jnp.array(0.0)) which will fail for jnp.sign
-        # as jax.grad(jnp.sign)(0.0) is nan.
-        fn_non_diff = lambda x: jnp.sign(x) 
-        with pytest.raises(TypeError, match="Failed to compute derivatives"):
-            _get_activation_derivatives(fn_non_diff, "test_non_differentiable_sign")
-
-    def test_custom_non_jax_traceable_function(self):
-        # A function that cannot be traced by JAX due to Python control flow based on abstract value
-        def fn_problematic(x):
-            if x > 0: # This type of condition on an abstract tracer causes ConcretizationTypeError
-                return x * x
-            else:
-                return x
-        
-        with pytest.raises(TypeError, match="Failed to compute derivatives"):
-            # This will likely fail at the jax.eval_shape(activation_fn, ...) stage itself
-            _get_activation_derivatives(fn_problematic, "test_problematic_python_control_flow")
-
-
-    def test_once_not_twice_differentiable(self):
-        # f(x) = x^2 if x >=0, else x^3. f'(x) = 2x if x >=0, else 3x^2. f'(0)=0.
-        # f''(x) = 2 if x > 0, else 6x. f''(0+)=2, f''(0-)=0. Not twice differentiable at 0.
-        # jax.grad(jax.grad(fn))(0.0) might give one of the one-sided derivatives or raise error depending on JAX version/config
-        # The key is that _get_activation_derivatives tries jax.eval_shape on grad_grad_fn at 0.0.
-        # If JAX's grad(grad(fn)) is NaN at 0, or if eval_shape itself detects an issue, it should fail.
-        def fn_once_diff(x_scalar):
-            # Ensure scalar input for this specific definition
-            if not isinstance(x_scalar, jax.Array) or x_scalar.ndim != 0:
-                 raise ValueError("This function is defined for scalar JAX arrays only for this test.")
-            if x_scalar >= 0:
-                return x_scalar**2
-            else:
-                return x_scalar**3
-        
-        # Let's test the behavior of jax.grad(jax.grad(fn_once_diff))(0.0)
-        # grad1 = jax.grad(fn_once_diff)
-        # grad2 = jax.grad(grad1)
-        # print(f"g'(0) = {grad1(jnp.array(0.0))}") # Expected 0
-        # print(f"g''(0) = {grad2(jnp.array(0.0))}") # Expected 2 (JAX often takes the right-hand derivative)
-        # So, this function might actually pass if JAX consistently provides a value for g''(0).
-        # The requirement is to test a function that *fails* _get_activation_derivatives.
-
-        # Let's use a clearer case: f(x) = x|x|. f'(x) = 2|x|. f''(x) = 2sign(x) (problem at 0).
+    def test_abs_times_x_fails_derivatives(self): 
         fn_abs_times_x = lambda x: x * jnp.abs(x)
-        # jax.grad(jax.grad(fn_abs_times_x))(0.0) is NaN.
-        # So jax.eval_shape(jax.grad(jax.grad(fn_abs_times_x)), jnp.array(0.0)) should fail.
-
         with pytest.raises(TypeError, match="Failed to compute derivatives"):
             _get_activation_derivatives(fn_abs_times_x, "test_abs_times_x")
 
-class TestAugmentedState:
-    @pytest.mark.parametrize("dim", [1, 2, 3, 5])
-    def test_from_coords_structure(self, dim):
-        batch_size = 4
-        coords = jr.normal(key, (batch_size, dim))
-        aug_state = AugmentedState.from_coords(coords)
-
-        chex.assert_trees_all_close(aug_state.value, coords)
-        
-        assert isinstance(aug_state.spatial_derivatives, list)
-        assert len(aug_state.spatial_derivatives) == dim
-        
-        for i in range(dim):
-            expected_deriv_i = jnp.zeros_like(coords)
-            expected_deriv_i = expected_deriv_i.at[:, i].set(1.0)
-            chex.assert_trees_all_close(aug_state.spatial_derivatives[i], expected_deriv_i, 
-                                        err_msg=f"Spatial derivative {i} mismatch for dim {dim}")
-            assert aug_state.spatial_derivatives[i].shape == (batch_size, dim)
-
-        expected_laplacian = jnp.zeros_like(coords)
-        chex.assert_trees_all_close(aug_state.laplacian, expected_laplacian)
-        assert aug_state.laplacian.shape == (batch_size, dim)
-
-    @pytest.mark.parametrize("dim, expected_s_components", [
-        (1, 1 + 1 + 1), # value + 1_deriv + laplacian
-        (2, 1 + 2 + 1), # value + 2_derivs + laplacian
-        (3, 1 + 3 + 1), # value + 3_derivs + laplacian
-    ])
-    def test_num_s_components(self, dim, expected_s_components):
-        batch_size = 2
-        coords = jr.normal(key, (batch_size, dim))
-        aug_state = AugmentedState.from_coords(coords)
-        assert aug_state.num_s_components == expected_s_components
-
-    @pytest.mark.parametrize("dim", [1, 2, 3])
-    def test_concatenate_components(self, dim):
-        batch_size = 3
-        features_at_input = dim # from_coords sets features = dim
-        coords = jr.normal(key, (batch_size, dim)) 
-        aug_state = AugmentedState.from_coords(coords)
-
-        s_components = aug_state.num_s_components
-        concatenated = aug_state.concatenate_components()
-
-        assert concatenated.shape == (s_components * batch_size, features_at_input)
-
-        # Verify order and content
-        manual_concat_list = [aug_state.value] + aug_state.spatial_derivatives + [aug_state.laplacian]
-        expected_concatenated = jnp.concatenate(manual_concat_list, axis=0)
-        chex.assert_trees_all_close(concatenated, expected_concatenated)
-
-        # Test with a dummy state that has different feature dimensions mid-network
-        # This is more a test of the logic if features change, though from_coords won't create this.
-        value_mock = jr.normal(key, (batch_size, 10))
-        spatial_derivs_mock = [jr.normal(key, (batch_size, 10)) for _ in range(dim)]
-        laplacian_mock = jr.normal(key, (batch_size, 10))
-        
-        aug_state_mock_features = AugmentedState(
-            value=value_mock,
-            spatial_derivatives=spatial_derivs_mock,
-            laplacian=laplacian_mock
+class TestFactorComputations:
+    def test_augmented_factor_terms_simple_laplacian(self):
+        global key; key_model, key_data = jr.split(key)
+        batch_size, spatial_dim, pde_order = 1, 1, 2
+        in_features, out_features = spatial_dim, 1 
+        layer = eqx.nn.Linear(in_features, out_features, key=key_model)
+        layer = eqx.tree_at(lambda l: l.weight, layer, jnp.array([[2.0]]))
+        layer = eqx.tree_at(lambda l: l.bias, layer, jnp.array([0.5]))
+        model = eqx.nn.Sequential([layer])
+        params, static_model = eqx.partition(model, eqx.is_array)
+        model_eval = eqx.combine(static_model, params)
+        interior_pts = jnp.array([[0.5]]) 
+        def rhs_fn_zero(coords): return jnp.zeros(coords.shape[0])
+        expected_a_contrib = jnp.array([[0.5], [1.0], [0.0]]) 
+        expected_b_contrib = jnp.array([[0.0], [0.0], [0.0]]) 
+        factor_contributions = _augmented_factor_terms(
+            model_eval, params, interior_pts, rhs_fn_zero, pde_order, spatial_dim
         )
-        s_components_mock = aug_state_mock_features.num_s_components
-        concatenated_mock = aug_state_mock_features.concatenate_components()
-        assert concatenated_mock.shape == (s_components_mock * batch_size, 10)
-        
-        manual_concat_list_mock = [value_mock] + spatial_derivs_mock + [laplacian_mock]
-        expected_concatenated_mock = jnp.concatenate(manual_concat_list_mock, axis=0)
-        chex.assert_trees_all_close(concatenated_mock, expected_concatenated_mock)
+        assert len(factor_contributions) == 1 
+        a_contrib_calc, b_contrib_calc = factor_contributions[0]
+        assert_allclose(a_contrib_calc, expected_a_contrib, atol=1e-6)
+        assert_allclose(b_contrib_calc, expected_b_contrib, atol=1e-6)
 
-# Helper function for scalar activation derivatives (used in tests)
-def get_scalar_fn_derivatives(scalar_activation_fn):
-    """Returns the function, its vmapped grad, and vmapped grad(grad)."""
-    return scalar_activation_fn, jax.vmap(jax.grad(scalar_activation_fn)), jax.vmap(jax.grad(jax.grad(scalar_activation_fn)))
-
-class TestAugmentedStatePropagation:
-    @pytest.mark.parametrize("dim, in_features, out_features", [
-        (2, 2, 3), # dim matches in_features
-        (3, 3, 2),
-        (2, 3, 4)  # dim != in_features (initial aug state features = dim, layer in_features must match aug_state.value.shape[1])
-    ])
-    def test_propagate_linear_augmented(self, dim, in_features, out_features):
-        key_prop, key_aug, key_layer = jr.split(key, 3)
-        batch_size = 2
-        
-        # Create initial augmented state. For this test, its feature dimension must match layer's in_features.
-        # So, if layer expects in_features, the input coords for aug_state should have 'in_features' columns.
-        # The 'dim' parameter here represents the number of spatial dimensions for derivative calculations,
-        # while 'in_features' is the feature dimension of the layer's input.
-        # For the *first* layer, in_features often equals dim.
-        
-        # Mock an augmented state whose components have `in_features`
-        mock_value = jr.normal(key_aug, (batch_size, in_features))
-        mock_spatial_derivatives = [jr.normal(key_aug, (batch_size, in_features)) for _ in range(dim)]
-        mock_laplacian = jr.normal(key_aug, (batch_size, in_features))
-        
-        aug_state_input = AugmentedState(
-            value=mock_value,
-            spatial_derivatives=mock_spatial_derivatives,
-            laplacian=mock_laplacian
-        )
-
-        linear_layer = eqx.nn.Linear(in_features, out_features, key=key_layer)
-
-        # Propagation
-        aug_state_output = _propagate_linear_augmented(aug_state_input, linear_layer)
-
-        # Expected values
-        expected_value = aug_state_input.value @ linear_layer.weight.T + linear_layer.bias
-        expected_spatial_derivatives = [s_deriv @ linear_layer.weight.T for s_deriv in aug_state_input.spatial_derivatives]
-        expected_laplacian = aug_state_input.laplacian @ linear_layer.weight.T
-
-        chex.assert_trees_all_close(aug_state_output.value, expected_value, atol=1e-6)
-        assert len(aug_state_output.spatial_derivatives) == dim
-        for i in range(dim):
-            chex.assert_trees_all_close(aug_state_output.spatial_derivatives[i], expected_spatial_derivatives[i], atol=1e-6)
-        chex.assert_trees_all_close(aug_state_output.laplacian, expected_laplacian, atol=1e-6)
-
-        assert aug_state_output.value.shape == (batch_size, out_features)
-        for i in range(dim):
-            assert aug_state_output.spatial_derivatives[i].shape == (batch_size, out_features)
-        assert aug_state_output.laplacian.shape == (batch_size, out_features)
-
-    @pytest.mark.parametrize("dim, features, scalar_activation_fn_name", [
-        (2, 3, "tanh"),
-        (3, 2, "relu"),
-        (1, 4, "sin"),
-        (2, 2, "identity"), # Test with identity like activation
-    ])
-    def test_propagate_activation_augmented(self, dim, features, scalar_activation_fn_name):
-        key_prop, key_aug = jr.split(key, 2)
-        batch_size = 5
-
-        if scalar_activation_fn_name == "tanh":
-            scalar_fn = jnp.tanh
-        elif scalar_activation_fn_name == "relu":
-            scalar_fn = jax.nn.relu
-        elif scalar_activation_fn_name == "sin":
-            scalar_fn = jnp.sin
-        elif scalar_activation_fn_name == "identity":
-            scalar_fn = lambda x: x # Identity
-        else:
-            raise ValueError(f"Unknown activation fn: {scalar_activation_fn_name}")
-
-        act_fn, vmap_grad, vmap_grad_grad = get_scalar_fn_derivatives(scalar_fn)
-
-        # Mock an augmented state (pre-activation)
-        s_val = jr.normal(key_aug, (batch_size, features))
-        s_spatial_derivatives = [jr.normal(key_aug, (batch_size, features)) for _ in range(dim)]
-        s_lap = jr.normal(key_aug, (batch_size, features))
-        
-        aug_state_pre_activation = AugmentedState(
-            value=s_val,
-            spatial_derivatives=s_spatial_derivatives,
-            laplacian=s_lap
-        )
-
-        # Propagation
-        aug_state_output = _propagate_activation_augmented(
-            aug_state_pre_activation, act_fn, vmap_grad, vmap_grad_grad
-        )
-
-        # Expected values
-        sigma_prime_s = vmap_grad(s_val)
-        sigma_prime_prime_s = vmap_grad_grad(s_val)
-
-        expected_value = act_fn(s_val)
-        expected_spatial_derivatives = [sigma_prime_s * s_deriv for s_deriv in s_spatial_derivatives]
-        
-        sum_sq_spatial_derivs = sum(jnp.square(s_deriv) for s_deriv in s_spatial_derivatives)
-        term_sum_sq_derivs = sigma_prime_prime_s * sum_sq_spatial_derivs
-        expected_laplacian = sigma_prime_s * s_lap + term_sum_sq_derivs
-        
-        chex.assert_trees_all_close(aug_state_output.value, expected_value, atol=1e-6)
-        assert len(aug_state_output.spatial_derivatives) == dim
-        for i in range(dim):
-            chex.assert_trees_all_close(aug_state_output.spatial_derivatives[i], expected_spatial_derivatives[i], atol=1e-6)
-        chex.assert_trees_all_close(aug_state_output.laplacian, expected_laplacian, atol=1e-6)
-
-        # Assert shapes remain the same through activation
-        assert aug_state_output.value.shape == (batch_size, features)
-        for i in range(dim):
-            assert aug_state_output.spatial_derivatives[i].shape == (batch_size, features)
-        assert aug_state_output.laplacian.shape == (batch_size, features)
-
-    @pytest.mark.parametrize("dim, features_seq", [
-        (2, [2, 3, 1]), # dim=2, L1: 2->3, Act, L2: 3->1
-        (3, [3, 4, 5, 2]), # dim=3, L1: 3->4, Act, L2: 4->5, Act, L3: 5->2
-    ])
-    def test_augmented_forward_cache(self, dim, features_seq):
-        key_model, key_input = jr.split(key, 2)
-        batch_size = 4
-        
-        # Input coordinates have `dim` features
-        input_coords = jr.normal(key_input, (batch_size, dim))
-        initial_aug_state = AugmentedState.from_coords(input_coords)
-
-        # Build model
-        layers = []
-        current_in_features = dim
-        num_linear_layers = 0
-        for i, out_features in enumerate(features_seq):
-            key_model, subkey = jr.split(key_model)
-            layers.append(eqx.nn.Linear(current_in_features, out_features, key=subkey))
-            num_linear_layers +=1
-            if i < len(features_seq) - 1: # Add activation after all but last linear layer
-                layers.append(eqx.nn.Lambda(jnp.tanh))
-            current_in_features = out_features
-        
-        model = eqx.nn.Sequential(layers)
-        
-        # Execute _augmented_forward_cache
-        aug_input_acts, aug_pre_acts, final_aug_output = _augmented_forward_cache(model, initial_aug_state)
-
-        assert len(aug_input_acts) == num_linear_layers
-        assert len(aug_pre_acts) == num_linear_layers
-
-        # Check shapes for input activations (Z_in_l)
-        # Z_in_0 (input to first linear)
-        assert aug_input_acts[0].value.shape == (batch_size, dim) 
-        for sd in aug_input_acts[0].spatial_derivatives:
-            assert sd.shape == (batch_size, dim)
-        assert aug_input_acts[0].laplacian.shape == (batch_size, dim)
-
-        # Check shapes for pre-activations (S_out_l) and subsequent input_acts (Z_in_l = act(S_out_{l-1}))
-        # and final_aug_output
-        expected_feature_size = dim
-        for i in range(num_linear_layers):
-            # S_out_l (output of linear_i, pre-activation)
-            current_linear_layer_model = model.layers[i*2 if i*2 < len(model.layers) else -1] # Assuming alternating Linear/Lambda
-            if not isinstance(current_linear_layer_model, eqx.nn.Linear): # Should not happen with test setup
-                current_linear_layer_model = model.layers[0] # Failsafe for pylint
-            
-            expected_feature_size_linear_out = current_linear_layer_model.out_features
-            
-            assert aug_pre_acts[i].value.shape == (batch_size, expected_feature_size_linear_out)
-            for sd in aug_pre_acts[i].spatial_derivatives:
-                assert sd.shape == (batch_size, expected_feature_size_linear_out)
-            assert aug_pre_acts[i].laplacian.shape == (batch_size, expected_feature_size_linear_out)
-
-            # Z_in_{l+1} (input to (l+1)-th linear layer = activation(S_out_l))
-            # If there is a next linear layer
-            if i < num_linear_layers -1 :
-                # After activation, feature size remains the same as S_out_l
-                assert aug_input_acts[i+1].value.shape == (batch_size, expected_feature_size_linear_out)
-                for sd in aug_input_acts[i+1].spatial_derivatives:
-                    assert sd.shape == (batch_size, expected_feature_size_linear_out)
-                assert aug_input_acts[i+1].laplacian.shape == (batch_size, expected_feature_size_linear_out)
-        
-        # Final output (Z_out_L or S_out_L if last layer has no activation)
-        final_layer_out_features = features_seq[-1]
-        assert final_aug_output.value.shape == (batch_size, final_layer_out_features)
-        for sd in final_aug_output.spatial_derivatives:
-            assert sd.shape == (batch_size, final_layer_out_features)
-        assert final_aug_output.laplacian.shape == (batch_size, final_layer_out_features)
-
-        # Basic plausibility: check if initial input matches first aug_input_act
-        chex.assert_trees_all_close(aug_input_acts[0].value, initial_aug_state.value)
-        for i_sd in range(dim):
-            chex.assert_trees_all_close(aug_input_acts[0].spatial_derivatives[i_sd], initial_aug_state.spatial_derivatives[i_sd])
-        chex.assert_trees_all_close(aug_input_acts[0].laplacian, initial_aug_state.laplacian)
-
-class TestFactorCalculations:
-    @pytest.mark.parametrize("in_f, out_f, batch_s", [(2, 1, 3), (3, 2, 5)])
-    def test_standard_factor_terms(self, in_f, out_f, batch_s):
-        key_model, key_data = jr.split(key, 2)
-        model = eqx.nn.Sequential([
-            eqx.nn.Linear(in_f, out_f, key=key_model),
-            # No activation for simplicity in checking grads, or use identity
-        ])
-        
-        dummy_pts = jr.normal(key_data, (batch_s, in_f))
-        dummy_targets = jr.normal(key_data, (batch_s, out_f)) # Targets for a simple loss
-
-        def loss_fn_std(m, batch_data):
-            x_data, t_data = batch_data
-            preds = jax.vmap(m)(x_data) # (batch, out_f)
-            return 0.5 * jnp.mean((preds - t_data)**2)
-
-        # This function is not directly used by PINNKFAC for factor calculation anymore,
-        # but its components _standard_forward_cache and _standard_backward_pass are.
-        # We'll test those as they are used for boundary terms in PINNKFAC.step.
-        
-        # 1. Test _standard_forward_cache
-        y_pred_fwd, acts_std_fwd, pre_std_fwd, phi_std_fwd = _standard_forward_cache(model, dummy_pts)
-        
-        assert len(acts_std_fwd) == 1 # One linear layer
-        assert len(pre_std_fwd) == 1
-        assert len(phi_std_fwd) == 1
-        
-        chex.assert_trees_all_close(acts_std_fwd[0], dummy_pts) # Input to linear layer
-        expected_pre_act = dummy_pts @ model.layers[0].weight.T + model.layers[0].bias
-        chex.assert_trees_all_close(pre_std_fwd[0], expected_pre_act)
-        chex.assert_trees_all_close(phi_std_fwd[0], jnp.ones_like(expected_pre_act)) # Since no activation after linear
-        chex.assert_trees_all_close(y_pred_fwd, expected_pre_act) # Output of model is output of linear
-
-        # 2. Test _standard_backward_pass
-        # Mimic what happens in PINNKFAC.step for boundary terms
-        # grad_out_b = (y_pred_fwd.squeeze() - dummy_targets.squeeze()) / batch_s # If single output
-        # For multi-output, ensure shapes match
-        
-        # If out_f is 1, squeeze, else ensure shapes are compatible.
-        y_pred_squeezed = y_pred_fwd.squeeze() if out_f == 1 else y_pred_fwd
-        targets_squeezed = dummy_targets.squeeze() if out_f == 1 else dummy_targets
-
-        if out_f == 1 and y_pred_squeezed.ndim == 0: # If batch_s=1 and out_f=1, squeeze() makes it scalar
-             y_pred_squeezed = y_pred_squeezed[None] # Make it (1,)
-             targets_squeezed = targets_squeezed[None] if targets_squeezed.ndim ==0 else targets_squeezed
-        
-        # Ensure y_pred_squeezed and targets_squeezed have same shape for residual calculation.
-        # This might happen if batch_s=1 and out_f > 1, then squeeze has no effect.
-        # Or if batch_s > 1 and out_f = 1, then squeeze removes last dim.
-        # The target shape for res_b should be (batch_s,) if out_f is 1, or (batch_s, out_f) if out_f > 1.
-
-        # Reshape targets if needed, assuming predictions are (batch_s, out_f) or (batch_s,) if out_f=1
-        if out_f == 1 and targets_squeezed.ndim == 2 and targets_squeezed.shape[1] == 1:
-            targets_squeezed = targets_squeezed.squeeze(-1)
-        
-        # This matches PINNKFAC's boundary residual calculation
-        if out_f == 1:
-            res_b = y_pred_squeezed - targets_squeezed # Should be (batch_s,)
-        else: # out_f > 1
-            res_b = y_pred_squeezed - targets_squeezed # Should be (batch_s, out_f)
-
-        grad_out_b = res_b / batch_s 
-        
-        deltas_std_bwd = _standard_backward_pass(model, pre_std_fwd, phi_std_fwd, grad_out_b)
-        assert len(deltas_std_bwd) == 1
-        # delta = grad_output * phi_prime. Here phi_prime is 1.
-        # So delta should be grad_out_b (if reshaped appropriately by _standard_backward_pass)
-        # grad_out_b might be (batch_s,) or (batch_s, out_f)
-        # deltas_std_bwd[0] should be (batch_s, out_f)
-        
-        expected_delta0_shape = (batch_s, out_f)
-        assert deltas_std_bwd[0].shape == expected_delta0_shape
-        
-        # If grad_out_b was (batch_s,), _standard_backward_pass adds a dim if it was 1D.
-        grad_out_b_for_check = grad_out_b
-        if grad_out_b.ndim == 1:
-             grad_out_b_for_check = grad_out_b[:, None] # (batch, 1) if out_f was 1
-
-        chex.assert_trees_all_close(deltas_std_bwd[0], grad_out_b_for_check * phi_std_fwd[0], atol=1e-6)
-
-
-    @pytest.mark.parametrize("dim, features_seq", [
-        (2, [2, 3, 1]), # Model: Linear(2,3)->Tanh->Linear(3,1)
-        (1, [1, 2, 1]), # Model: Linear(1,2)->Tanh->Linear(2,1)
-    ])
-    def test_augmented_factor_terms(self, dim, features_seq):
-        key_model, key_data = jr.split(key, 2)
-        batch_s = 6 # Needs to be multiple of S for some checks if they were there
-
-        # Build model
-        layers = []
-        current_in_features = dim
-        for i, out_features in enumerate(features_seq):
-            key_model, subkey = jr.split(key_model)
-            layers.append(eqx.nn.Linear(current_in_features, out_features, key=subkey))
-            if i < len(features_seq) - 1: # Add activation after all but last linear layer
-                layers.append(eqx.nn.Lambda(jnp.tanh))
-            current_in_features = out_features
-        model = eqx.nn.Sequential(layers)
-        params, static = eqx.partition(model, eqx.is_array)
-        model_eval = eqx.combine(static, params) # Model with current params
-
-        interior_pts = jr.normal(key_data, (batch_s, dim))
-        
-        # Dummy rhs_fn, output should match final model output feature size
-        final_out_features = features_seq[-1]
-        def rhs_fn_mock(coords): # Coords are (batch, dim)
-            # Returns (batch,) or (batch, final_out_features)
-            # For this test, let its output match the laplacian's shape (batch, final_out_features)
-            # or (batch,) if final_out_features is 1
-            if final_out_features == 1:
-                return jnp.sum(coords**2, axis=1) * 0.1 # (batch_s,)
-            else:
-                # Create something of shape (batch_s, final_out_features)
-                return jnp.tile((jnp.sum(coords**2, axis=1) * 0.1)[:, None], (1, final_out_features))
-
-        # Execute
-        factor_contributions = _augmented_factor_terms(model_eval, params, interior_pts, rhs_fn_mock)
-        
-        num_linear_layers = len(features_seq)
-        assert len(factor_contributions) == num_linear_layers
-
-        # Check shapes of a_contrib and b_contrib for each layer
-        current_expected_in_features = dim
-        for k_layer_idx in range(num_linear_layers):
-            a_k, b_k = factor_contributions[k_layer_idx]
-            
-            # Determine S for this input state
-            # Z_in_0 (input to first linear layer)
-            if k_layer_idx == 0:
-                s_components_for_a_k = 1 + dim + 1 # value + d_derivs + laplacian (all from initial_aug_state)
-                features_for_a_k = dim # features of initial_aug_state.value etc.
-            else:
-                # Z_in_l = activation(S_out_{l-1})
-                # S_out_{l-1} is output of (k_layer_idx-1)-th linear layer
-                prev_linear_out_features = features_seq[k_layer_idx-1]
-                # After activation, spatial_derivatives list length is still dim
-                s_components_for_a_k = 1 + dim + 1 
-                features_for_a_k = prev_linear_out_features
-
-            assert a_k.shape == (s_components_for_a_k * batch_s, features_for_a_k)
-            
-            # b_k is dL/dS_out_l (concatenated). S_out_l is output of k-th linear layer.
-            current_linear_out_features = features_seq[k_layer_idx]
-            s_components_for_b_k = 1 + dim + 1 # Grad of S_out_l also has these components
-            features_for_b_k = current_linear_out_features
-            
-            assert b_k.shape == (s_components_for_b_k * batch_s, features_for_b_k)
-            
-            current_expected_in_features = current_linear_out_features # For next layer's input
+    def test_standard_factors_simple_boundary(self):
+        global key; key_model, key_data = jr.split(key)
+        batch_size, in_features, out_features = 1, 1, 1
+        layer = eqx.nn.Linear(in_features, out_features, key=key_model)
+        layer = eqx.tree_at(lambda l: l.weight, layer, jnp.array([[3.0]]))
+        layer = eqx.tree_at(lambda l: l.bias, layer, jnp.array([-0.5]))
+        model = eqx.nn.Sequential([layer]) 
+        boundary_pts = jnp.array([[1.0]]) 
+        def bc_fn_target(coords): return jnp.array([2.0]) 
+        y_pred, acts_std, pre_std, phi_std = _standard_forward_cache(model, boundary_pts)
+        assert len(acts_std) == 1 and jnp.allclose(acts_std[0], boundary_pts, atol=1e-6) 
+        res_b = y_pred.squeeze() - bc_fn_target(boundary_pts)
+        grad_out_b = res_b / batch_size
+        deltas_std = _standard_backward_pass(model, pre_std, phi_std, grad_out_b)
+        assert len(deltas_std) == 1 and jnp.allclose(deltas_std[0], jnp.array([[0.5]]), atol=1e-6)
+        a_bd_contrib_mat = (acts_std[0].T @ acts_std[0]) / batch_size
+        assert_allclose(a_bd_contrib_mat, jnp.array([[1.0]]), atol=1e-6)
+        b_bd_contrib_mat = (deltas_std[0].T @ deltas_std[0]) / batch_size
+        assert_allclose(b_bd_contrib_mat, jnp.array([[0.25]]), atol=1e-6)
 
 class TestGradientPreconditioning:
-    @pytest.mark.parametrize("in_f, out_f, damping_o, damping_b_val", [
-        (2, 3, 1e-3, 1e-3),
-        (3, 2, 1e-2, 1e-1)
+    @pytest.mark.parametrize("in_f, out_f, use_boundary, damping", [
+        (1, 1, False, 0.0), (2, 1, True, 1e-3), (1, 2, True, 1e-3), (2, 2, True, 1e-2),
     ])
-    def test_preconditioned_gradient_calculation(self, in_f, out_f, damping_o, damping_b_val):
-        key_layer, key_grads, key_factors = jr.split(key, 3)
-
-        # Dummy gradients
-        gw = jr.normal(key_grads, (out_f, in_f)) # grad w.r.t. weight
-        gb = jr.normal(key_grads, (out_f,))      # grad w.r.t. bias
-
-        # Dummy KFAC factors (random PSD)
-        A_o_val = jr.normal(key_factors, (in_f, in_f)); A_o_val = (A_o_val @ A_o_val.T)/2 + jnp.eye(in_f) * 1e-2
-        B_o_val = jr.normal(key_factors, (out_f, out_f)); B_o_val = (B_o_val @ B_o_val.T)/2 + jnp.eye(out_f) * 1e-2
-        A_b_val = jr.normal(key_factors, (in_f, in_f)); A_b_val = (A_b_val @ A_b_val.T)/2 + jnp.eye(in_f) * 1e-2
-        B_b_val = jr.normal(key_factors, (out_f, out_f)); B_b_val = (B_b_val @ B_b_val.T)/2 + jnp.eye(out_f) * 1e-2
-
-        lf = LayerFactors(
-            A_omega=A_o_val, B_omega=B_o_val,
-            A_boundary=A_b_val, B_boundary=B_b_val,
-            mw=jnp.zeros_like(gw), mb=jnp.zeros_like(gb)
-        )
-
-        # Damped factors for eigendecomposition (Mimicking PINNKFAC.step)
-        Aw_damped = lf.A_omega + damping_o * jnp.eye(lf.A_omega.shape[0])
-        Gw_damped = lf.B_omega + damping_o * jnp.eye(lf.B_omega.shape[0])
-        Aw_b_damped = lf.A_boundary + damping_b_val * jnp.eye(lf.A_boundary.shape[0])
-        Gw_b_damped = lf.B_boundary + damping_b_val * jnp.eye(lf.B_boundary.shape[0])
-        
-        eig_A, UA = jnp.linalg.eigh(Aw_damped)
-        eig_G, UG = jnp.linalg.eigh(Gw_damped)
-        eig_Ab, UAb = jnp.linalg.eigh(Aw_b_damped)
-        eig_Gb, UGb = jnp.linalg.eigh(Gw_b_damped)
-
-        # Preconditioning logic from PINNKFAC.step
-        gw_kfac_layer = UA.T @ gw @ UG
+    def test_preconditioned_gradient_identity_factors(self, in_f, out_f, use_boundary, damping):
+        global key; key_grads, key_factors = jr.split(key)
+        gw = jr.normal(key_grads, (out_f, in_f)); gb = jr.normal(key_grads, (out_f,))      
+        lf = LayerFactors( A_omega=jnp.eye(in_f), B_omega=jnp.eye(out_f),
+            A_boundary=jnp.eye(in_f) if use_boundary else jnp.zeros((in_f, in_f)), 
+            B_boundary=jnp.eye(out_f) if use_boundary else jnp.zeros((out_f, out_f)), 
+            prev_update_w=jnp.zeros_like(gw), prev_update_b=jnp.zeros_like(gb) )
+        damping_omega_val = damping; damping_boundary_val = damping if use_boundary else 0.0
+        Aw_damped = lf.A_omega + damping_omega_val * jnp.eye(lf.A_omega.shape[0])
+        Gw_damped = lf.B_omega + damping_omega_val * jnp.eye(lf.B_omega.shape[0])
+        Aw_b_damped = lf.A_boundary + damping_boundary_val * jnp.eye(lf.A_boundary.shape[0])
+        Gw_b_damped = lf.B_boundary + damping_boundary_val * jnp.eye(lf.B_boundary.shape[0])
+        eig_A, UA = jnp.linalg.eigh(Aw_damped); eig_G, UG = jnp.linalg.eigh(Gw_damped)
+        eig_Ab, UAb = jnp.linalg.eigh(Aw_b_damped); eig_Gb, UGb = jnp.linalg.eigh(Gw_b_damped)
+        gw_kfac_layer_calc = UA.T @ gw @ UG
         precond_denominator_w = (eig_A[:, None] * eig_G[None, :]) + (eig_Ab[:, None] * eig_Gb[None, :])
-        # Add small epsilon to denominator for stability, as PINNKFAC does not explicitly do this after eigendecomp
-        # (damping in factors already helps, but direct division can still be risky if precond_denominator is tiny)
-        gw_kfac_layer = gw_kfac_layer / (precond_denominator_w + 1e-12) 
-        gw_kfac_layer = UA @ gw_kfac_layer @ UG.T
+        gw_kfac_layer_calc = gw_kfac_layer_calc / (precond_denominator_w + 1e-12) 
+        gw_kfac_layer_calc = UA @ gw_kfac_layer_calc @ UG.T
+        gb_kfac_layer_calc = UG.T @ gb
+        precond_denominator_b = eig_G + eig_Gb 
+        gb_kfac_layer_calc = gb_kfac_layer_calc / (precond_denominator_b + 1e-12) 
+        gb_kfac_layer_calc = UG @ gb_kfac_layer_calc
+        denom_w = 1.0 + damping_omega_val; denom_b = 1.0 + damping_omega_val
+        if use_boundary: denom_w += (1.0 + damping_boundary_val); denom_b += (1.0 + damping_boundary_val)
+        expected_gw_kfac = gw / denom_w; expected_gb_kfac = gb / denom_b
+        assert_allclose(gw_kfac_layer_calc, expected_gw_kfac, atol=1e-6)
+        assert_allclose(gb_kfac_layer_calc, expected_gb_kfac, atol=1e-6)
+        assert jnp.all(jnp.isfinite(gw_kfac_layer_calc)) and jnp.all(jnp.isfinite(gb_kfac_layer_calc))
+
+# --- Tests for Update Variants ---
+def get_test_model_and_params(key_model, in_f=1, out_f=1, num_layers=1):
+    if num_layers == 1: model_layers = [eqx.nn.Linear(in_f, out_f, key=key_model)]
+    elif num_layers == 2:
+        k1,k2 = jr.split(key_model)
+        model_layers = [eqx.nn.Linear(in_f, out_f*2, key=k1), eqx.nn.Lambda(jnp.tanh), eqx.nn.Linear(out_f*2, out_f, key=k2)]
+    else: raise ValueError("Test model only supports 1 or 2 linear layers")
+    model = eqx.nn.Sequential(model_layers)
+    params, static = eqx.partition(model, eqx.is_array)
+    return model, params, static
+
+class TestKFACStarUpdate:
+    def test_kfac_star_first_step(self):
+        global key; key_model, key_grads, key_deltas = jr.split(key, 3)
+        model, params, static_model = get_test_model_and_params(key_model)
+        lin_indices = [i for i, lyr in enumerate(model.layers) if isinstance(lyr, eqx.nn.Linear)]
+        optimizer = PINNKFAC() 
+        grads_val = jr.normal(key_grads, (1,1)); grads_bias = jr.normal(key_grads, (1,))
+        grads_tree = build_tree_from_parts_for_test([{'weight': grads_val, 'bias': grads_bias}], params, lin_indices)
+        delta_t_val = jr.normal(key_deltas, (1,1)) * 0.1; delta_t_bias = jr.normal(key_deltas, (1,)) * 0.1
+        current_preconditioned_delta_tree = build_tree_from_parts_for_test(
+            [{'weight': delta_t_val, 'bias': delta_t_bias}], params, lin_indices)
+        previous_update_tree = build_tree_from_parts_for_test( 
+            [{'weight': jnp.zeros_like(delta_t_val), 'bias': jnp.zeros_like(delta_t_bias)}], params, lin_indices)
+        layer_factors_list = [LayerFactors( A_omega=jnp.eye(1), B_omega=jnp.eye(1), A_boundary=jnp.eye(1), B_boundary=jnp.eye(1),
+            prev_update_w=jnp.zeros_like(delta_t_val), prev_update_b=jnp.zeros_like(delta_t_bias)) for _ in lin_indices]
+        current_kfac_factors_state = PINNKFACState(step=1, layers=tuple(layer_factors_list))
         
-        gb_kfac_layer = UG.T @ gb
-        precond_denominator_b = eig_G + eig_Gb
-        gb_kfac_layer = gb_kfac_layer / (precond_denominator_b + 1e-12)
-        gb_kfac_layer = UG @ gb_kfac_layer
+        # Mock Gv products by assuming G_undamped = I
+        mock_g_Delta_tree = current_preconditioned_delta_tree
+        mock_g_delta_tree = previous_update_tree # which is zero
+
+        Delta_g_Delta = tree_dot(current_preconditioned_delta_tree, mock_g_Delta_tree)
+        Delta_norm_sq = tree_dot(current_preconditioned_delta_tree, current_preconditioned_delta_tree)
+        linear_coeff_alpha = -tree_dot(current_preconditioned_delta_tree, grads_tree)
+        quad_coeff_alpha = Delta_g_Delta + optimizer.damping_kfac_star_model * Delta_norm_sq
+        expected_alpha_star = linear_coeff_alpha / quad_coeff_alpha if jnp.abs(quad_coeff_alpha) > 1e-8 else 0.0
         
-        # The test mainly checks that this calculation runs and produces outputs of the correct shape.
-        # Correctness of KFAC itself is a larger research topic.
-        chex.assert_shape(gw_kfac_layer, gw.shape)
-        chex.assert_shape(gb_kfac_layer, gb.shape)
-        # Check for NaNs or Infs
-        assert jnp.all(jnp.isfinite(gw_kfac_layer))
-        assert jnp.all(jnp.isfinite(gb_kfac_layer))
-
-
-class TestKFACStarHeuristics:
-    @pytest.mark.parametrize("seed", [0, 42])
-    def test_tree_dot(self, seed):
-        key_dot = jr.PRNGKey(seed)
-        key1, key2 = jr.split(key_dot)
-
-        tree1_leaf1 = jr.normal(key1, (2,3))
-        tree1_leaf2 = jr.normal(key1, (1,2))
-        # Using a simple PyTree structure (list of arrays) for this test
-        tree1 = [tree1_leaf1, tree1_leaf2] 
-        # To test None skipping, we need a structure where eqx.is_array is False
-        # tree1_with_none = [tree1_leaf1, None, tree1_leaf2] # This would fail len check
-
-        tree2_leaf1 = jr.normal(key2, (2,3))
-        tree2_leaf2 = jr.normal(key2, (1,2))
-        tree2 = [tree2_leaf1, tree2_leaf2]
+        original_cgvp = optimizer._compute_kfac_star_update.__globals__['compute_gramian_vector_product']
+        def mock_cgvp(vec_tree, *args): return vec_tree # Assumes G=I
+        optimizer._compute_kfac_star_update.__globals__['compute_gramian_vector_product'] = mock_cgvp
         
-        dot_product = tree_dot(tree1, tree2)
-        expected_dot = jnp.sum(tree1_leaf1 * tree2_leaf1) + jnp.sum(tree1_leaf2 * tree2_leaf2)
-        chex.assert_trees_all_close(dot_product, expected_dot, atol=1e-6)
+        final_params_calc, final_layers_calc_tuple = optimizer._compute_kfac_star_update(
+            params, grads_tree, current_preconditioned_delta_tree, previous_update_tree,
+            model, current_kfac_factors_state, lin_indices, build_tree_from_parts_for_test)
+        optimizer._compute_kfac_star_update.__globals__['compute_gramian_vector_product'] = original_cgvp
 
-        # Test with a more complex structure including None (which should be skipped by tree_dot)
-        complex_tree1 = [tree1_leaf1, {'a': tree1_leaf2, 'b': eqx.nn.Linear(2,2,key=key1)}] # Static part
-        # Filter static parts before calling tree_dot as it's intended for parameter trees
-        dyn1, static1 = eqx.partition(complex_tree1, eqx.is_array)
-        
-        complex_tree2 = [tree2_leaf1, {'a': tree2_leaf2, 'b': eqx.nn.Linear(2,2,key=key2)}]
-        dyn2, static2 = eqx.partition(complex_tree2, eqx.is_array)
+        expected_update = jax.tree_map(lambda d: expected_alpha_star * d, current_preconditioned_delta_tree)
+        expected_final_params = jax.tree_map(lambda p, u: p - u, params, expected_update)
+        assert_allclose(final_params_calc.layers[0].weight, expected_final_params.layers[0].weight, atol=1e-6)
+        assert_allclose(final_layers_calc_tuple[0].prev_update_w, expected_update.layers[0].weight, atol=1e-6)
 
-        dot_product_dyn = tree_dot(dyn1, dyn2)
-        chex.assert_trees_all_close(dot_product_dyn, expected_dot, atol=1e-6)
+class TestStandardKFACUpdate:
+    def test_standard_kfac_momentum_fixed_lr(self):
+        global key; key_model, key_deltas = jr.split(key, 2)
+        model, params, _ = get_test_model_and_params(key_model)
+        lin_indices = [i for i, lyr in enumerate(model.layers) if isinstance(lyr, eqx.nn.Linear)]
+        lr, momentum = 0.1, 0.9
+        optimizer = PINNKFAC(lr=lr, momentum_coeff=momentum, use_line_search=False)
+        delta_t_val = jr.normal(key_deltas, (1,1)) * 0.1; delta_t_bias = jr.normal(key_deltas, (1,)) * 0.1
+        current_preconditioned_delta_tree = build_tree_from_parts_for_test(
+            [{'weight': delta_t_val, 'bias': delta_t_bias}], params, lin_indices)
+        prev_delta_val = jr.normal(key_deltas, (1,1)) * 0.05; prev_delta_bias = jr.normal(key_deltas, (1,)) * 0.05
+        previous_update_tree = build_tree_from_parts_for_test(
+            [{'weight': prev_delta_val, 'bias': prev_delta_bias}], params, lin_indices)
+        layer_factors = LayerFactors(A_omega=jnp.eye(1), B_omega=jnp.eye(1), A_boundary=jnp.eye(1), B_boundary=jnp.eye(1),
+            prev_update_w=prev_delta_val, prev_update_b=prev_delta_bias)
+        current_kfac_factors_state = PINNKFACState(step=2, layers=(layer_factors,))
+        def dummy_loss_fn(p): return 0.0 
+        final_params_calc, final_layers_calc_tuple = optimizer._compute_standard_kfac_update(
+            params, current_preconditioned_delta_tree, previous_update_tree,
+            current_kfac_factors_state, dummy_loss_fn, lin_indices)
+        hat_delta_t = jax.tree_map(lambda prev, curr: momentum * prev + curr, previous_update_tree, current_preconditioned_delta_tree)
+        expected_actual_update = jax.tree_map(lambda d: lr * d, hat_delta_t)
+        expected_final_params = jax.tree_map(lambda p, u: p - u, params, expected_actual_update)
+        assert_allclose(final_params_calc.layers[0].weight, expected_final_params.layers[0].weight, atol=1e-6)
+        assert_allclose(final_layers_calc_tuple[0].prev_update_w, expected_actual_update.layers[0].weight, atol=1e-6)
 
+    def test_standard_kfac_line_search(self):
+        global key; key_model, key_deltas, key_target = jr.split(key, 3)
+        model_ls, params_ls, static_ls = get_test_model_and_params(key_model, in_f=1, out_f=1)
+        target_w = jr.normal(key_target, (1,1))
+        def quadratic_loss_fn(ptree): return jnp.sum((ptree.layers[0].weight - target_w)**2)
+        lr_grid = jnp.array([0.1, 0.5, 1.0, 1.5, 2.0]) 
+        optimizer = PINNKFAC(use_line_search=True, line_search_grid_coeffs=lr_grid, momentum_coeff=0.0)
+        initial_w = params_ls.layers[0].weight + 1.0 
+        params_ls = eqx.tree_at(lambda p: p.layers[0].weight, params_ls, initial_w)
+        hat_delta_t_w = initial_w - target_w; hat_delta_t_b = jnp.array([0.0]) 
+        current_preconditioned_delta_tree = build_tree_from_parts_for_test(
+            [{'weight': hat_delta_t_w, 'bias': hat_delta_t_b}], params_ls, [0])
+        previous_update_tree = build_tree_from_parts_for_test( 
+            [{'weight': jnp.zeros_like(hat_delta_t_w), 'bias': jnp.zeros_like(hat_delta_t_b)}], params_ls, [0])
+        layer_factors = LayerFactors(A_omega=jnp.eye(1), B_omega=jnp.eye(1), A_boundary=jnp.eye(1), B_boundary=jnp.eye(1),
+            prev_update_w=jnp.zeros_like(hat_delta_t_w), prev_update_b=jnp.zeros_like(hat_delta_t_b))
+        current_kfac_factors_state = PINNKFACState(step=2, layers=(layer_factors,))
+        final_params_calc, final_layers_calc_tuple = optimizer._compute_standard_kfac_update(
+            params_ls, current_preconditioned_delta_tree, previous_update_tree,
+            current_kfac_factors_state, quadratic_loss_fn, [0])
+        expected_final_w = target_w
+        assert_allclose(final_params_calc.layers[0].weight, expected_final_w, atol=1e-5)
+        expected_stored_update_w = 1.0 * hat_delta_t_w
+        assert_allclose(final_layers_calc_tuple[0].prev_update_w, expected_stored_update_w, atol=1e-5)
 
-        # Test with non-matching structures (should raise ValueError for num_leaves)
-        tree_diff_struct = [tree1_leaf1] 
-        with pytest.raises(ValueError, match="PyTrees must have the same number of leaves."):
-            tree_dot(tree1, tree_diff_struct)
-            
-        # Test with non-matching shapes (should raise ValueError)
-        tree_diff_shape_leaf = jr.normal(key1, (3,3))
-        tree_diff_shape = [tree_diff_shape_leaf, tree1_leaf2]
-        with pytest.raises(ValueError, match="Leaves must have the same shape"):
-            tree_dot(tree1, tree_diff_shape)
-
-
-    @pytest.mark.parametrize("test_case_name, in_f, out_f", [
-        ("identity_factors", 2, 1),
-        ("identity_factors_v2", 3, 2),
-        ("diagonal_factors", 2, 3), # New case for diagonal factors
-        ("diagonal_factors_v2", 3, 2) 
-    ])
-    def test_compute_gramian_vector_product(self, test_case_name, in_f, out_f):
-        key_model, key_vec, key_factors_extra = jr.split(key, 3)
-        
-        model_layer = eqx.nn.Linear(in_f, out_f, key=key_model)
-        model = eqx.nn.Sequential([model_layer])
-        
-        vec_w = jr.normal(key_vec, (out_f, in_f))
-        vec_b = jr.normal(key_vec, (out_f,))
-        
-        # Build vector_tree that matches model structure (params)
-        dummy_params, _ = eqx.partition(model, eqx.is_array)
-        weight_path = lambda tree: tree.layers[0].weight
-        bias_path = lambda tree: tree.layers[0].bias
-        vector_tree = eqx.tree_at(weight_path, dummy_params, vec_w)
-        vector_tree = eqx.tree_at(bias_path, vector_tree, vec_b)
-
-        if "identity_factors" in test_case_name:
-            current_factors = LayerFactors(
-                A_omega=jnp.eye(in_f), B_omega=jnp.eye(out_f),
-                A_boundary=jnp.eye(in_f), B_boundary=jnp.eye(out_f),
-                mw=jnp.zeros_like(vec_w), mb=jnp.zeros_like(vec_b)
-            )
-            expected_gv_w = 2 * vec_w # (I V I^T + I V I^T) = V + V = 2V
-            expected_gv_b = 2 * vec_b # (I Vb + I Vb) = 2Vb
-        elif "diagonal_factors" in test_case_name:
-            # Simple diagonal matrices
-            diag_A_o = jr.uniform(key_factors_extra, (in_f,), minval=0.5, maxval=2.0)
-            diag_B_o = jr.uniform(key_factors_extra, (out_f,), minval=0.5, maxval=2.0)
-            diag_A_b = jr.uniform(key_factors_extra, (in_f,), minval=0.1, maxval=0.5)
-            diag_B_b = jr.uniform(key_factors_extra, (out_f,), minval=0.1, maxval=0.5)
-            
-            A_o = jnp.diag(diag_A_o)
-            B_o = jnp.diag(diag_B_o)
-            A_b = jnp.diag(diag_A_b)
-            B_b = jnp.diag(diag_B_b)
-            
-            current_factors = LayerFactors(
-                A_omega=A_o, B_omega=B_o,
-                A_boundary=A_b, B_boundary=B_b,
-                mw=jnp.zeros_like(vec_w), mb=jnp.zeros_like(vec_b)
-            )
-            # Expected: Gv_w = (B_o @ Vw @ A_o.T) + (B_b @ Vw @ A_b.T)
-            # Since A_o, A_b are diagonal, A.T = A
-            expected_gv_w = (B_o @ vec_w @ A_o) + (B_b @ vec_w @ A_b)
-            # Expected: Gv_b = (B_o @ Vb) + (B_b @ Vb)
-            expected_gv_b = (B_o @ vec_b) + (B_b @ vec_b)
-        else:
-            raise ValueError(f"Unknown test case: {test_case_name}")
-
-        kfac_factors_layers_tuple = tuple([current_factors])
-        gv_parts_list = compute_gramian_vector_product(vector_tree, model, kfac_factors_layers_tuple)
-        
-        assert len(gv_parts_list) == 1
-        gv_part = gv_parts_list[0]
-        
-        chex.assert_trees_all_close(gv_part['weight'], expected_gv_w, atol=1e-5, rtol=1e-5) # Increased tolerance for non-identity
-        chex.assert_trees_all_close(gv_part['bias'], expected_gv_b, atol=1e-5, rtol=1e-5)
-
-    def test_kfac_star_solver_first_step(self):
-        Delta_grad_dot = -0.5 
-        quad_coeff_alpha = 2.0
-        
-        expected_alpha_star = Delta_grad_dot / quad_coeff_alpha
-        expected_mu_star = 0.0
-        
-        # Logic from PINNKFAC.step (state.step == 1)
-        mu_star_calc = 0.0
-        alpha_star_calc = 0.0
-        if jnp.abs(quad_coeff_alpha) < 1e-8: # Heuristic from code
-            alpha_star_calc = 0.0
-        else:
-            alpha_star_calc = Delta_grad_dot / quad_coeff_alpha
-            
-        assert jnp.isclose(alpha_star_calc, expected_alpha_star)
-        assert jnp.isclose(mu_star_calc, expected_mu_star)
-
-    def test_kfac_star_solver_general_step_nonsingular(self):
-        quad_coeff_alpha = 2.0
-        quad_coeff_mu = 3.0
-        quad_coeff_alpha_mu = 0.5 
-        
-        linear_coeff_alpha = -1.0 
-        linear_coeff_mu = -0.5  
-
-        M = jnp.array([[quad_coeff_alpha, quad_coeff_alpha_mu],
-                       [quad_coeff_alpha_mu, quad_coeff_mu]])
-        b_vec = jnp.array([linear_coeff_alpha, linear_coeff_mu])
-        
-        solver_damping = 1e-6 
-        expected_solution = jnp.linalg.solve(M + solver_damping * jnp.eye(2), b_vec)
-        
-        # Simulate logic from PINNKFAC.step (else branch of state.step == 1)
-        alpha_star_calc, mu_star_calc = 0.0,0.0
-        try:
-            solution = jnp.linalg.solve(M + solver_damping * jnp.eye(2), b_vec)
-            alpha_star_calc, mu_star_calc = solution[0], solution[1]
-        except jnp.linalg.LinAlgError: # Should not happen for this non-singular case
-            alpha_star_calc, mu_star_calc = float('nan'), float('nan') # Fail test if it errors
-            
-        chex.assert_trees_all_close(jnp.array([alpha_star_calc, mu_star_calc]), expected_solution, atol=1e-6)
-
-    def test_kfac_star_solver_singular_fallback(self):
-        quad_coeff_alpha = 1.0
-        quad_coeff_mu = 1.0
-        quad_coeff_alpha_mu = 1.0 # M = [[1,1],[1,1]], singular
-        
-        linear_coeff_alpha = -0.5
-        # linear_coeff_mu = -0.2 # Not used in this specific fallback path
-
-        M = jnp.array([[quad_coeff_alpha, quad_coeff_alpha_mu],
-                       [quad_coeff_alpha_mu, quad_coeff_mu]])
-        b_vec = jnp.array([linear_coeff_alpha, 0.0]) # RHS for fallback check
-        solver_damping = 1e-6 
-
-        expected_alpha_star_fallback = linear_coeff_alpha / quad_coeff_alpha if jnp.abs(quad_coeff_alpha) >= 1e-8 else 0.0
-        expected_mu_star_fallback = 0.0
-
-        alpha_star_calc, mu_star_calc = 0.0, 0.0
-        # Simulate PINNKFAC.step fallback logic
-        try:
-            # This might not raise LinAlgError if solver_damping makes it non-singular
-            # The test here is more about the explicit fallback logic in PINNKFAC
-            # Forcing the condition that would lead to the fallback in a real scenario is tricky
-            # We assume the LinAlgError path is taken if jnp.linalg.solve fails.
-            # Here, let's assume it *did* fail and the except block is executed.
-            raise jnp.linalg.LinAlgError("Simulated error") 
-        except jnp.linalg.LinAlgError: 
-            # print("Warning: KFAC* 2x2 system solve failed. Using simplified update.") # Matches message
-            if jnp.abs(quad_coeff_alpha) < 1e-8:
-                alpha_star_calc = 0.0
-            else:
-                alpha_star_calc = linear_coeff_alpha / quad_coeff_alpha
-            mu_star_calc = 0.0
-        
-        assert jnp.isclose(alpha_star_calc, expected_alpha_star_fallback, atol=1e-7)
-        assert jnp.isclose(mu_star_calc, expected_mu_star_fallback, atol=1e-7)
-
-
-class TestPINNKFACStep:
-    @pytest.mark.parametrize("model_type", ["simple_linear", "one_hidden_layer"])
-    def test_step_updates_params_and_factors(self, model_type):
-        key_main = jr.PRNGKey(123)
-        key_model_init, key_opt_init, key_data = jr.split(key_main, 3)
-
-        # 1. Setup Model
-        if model_type == "simple_linear":
-            model = eqx.nn.Sequential([eqx.nn.Linear(1, 1, key=key_model_init)])
-        elif model_type == "one_hidden_layer":
-            k1, k2 = jr.split(key_model_init)
-            model = eqx.nn.Sequential([
-                eqx.nn.Linear(1, 2, key=k1), 
-                eqx.nn.Lambda(jnp.tanh), 
-                eqx.nn.Linear(2, 1, key=k2)
-            ])
-        else:
-            raise ValueError(f"Unknown model_type: {model_type}")
-
-        initial_params, initial_static = eqx.partition(model, eqx.is_array)
-
-        # 2. Define Dummy Loss Components
-        # rhs_fn output matches model's final layer output features (1 in this case)
-        # and expects coords (batch, dim_of_coords=1)
-        def rhs_fn_dummy(coords): # Laplacian target
-            return jnp.sum(coords * 0.1, axis=1) # Return (batch,)
-
-        def bc_fn_dummy(coords): # Boundary value target
-            return jnp.sum(coords * 0.2, axis=1) # Return (batch,)
-
-        # 3. Prepare Dummy Data
-        interior_coords = jr.uniform(key_data, (10, 1), minval=0.1, maxval=0.9) # (batch, dim_of_coords=1)
-        boundary_coords = jnp.array([[0.0], [1.0]]) # (batch, dim_of_coords=1)
-
-        # 4. Initialize Optimizer and State
-        optimizer = PINNKFAC(
-            lr=1e-3, # Not used by KFAC* directly for param update step size
-            damping_omega=1e-2, 
-            damping_boundary=1e-2, 
-            damping_kfac_star_model=1e-2, 
-            decay=0.95
-        )
-        
-        # Store original model and KFAC state (factors are initialized to I or 0)
-        original_model = model 
-        original_kfac_state = optimizer.init(original_model)
-
-        # 5. Execute optimizer.step
-        # Ensure no JIT compilation issues by running it once if needed, or just test as is.
-        # The functions inside step are complex, so direct JIT might be slow for first run.
-        # For testing, direct execution is fine.
-        new_model, new_kfac_state = optimizer.step(
-            original_model, rhs_fn_dummy, bc_fn_dummy, 
-            interior_coords, boundary_coords, original_kfac_state
-        )
-
-        # 6. Verify Parameter Updates
-        new_params, _ = eqx.partition(new_model, eqx.is_array)
-        
-        # Check that parameters are different.
-        # Using tree_dot to check for non-zero difference.
-        param_diff_sq_sum = tree_dot(
-            jax.tree_map(lambda x, y: x - y, initial_params, new_params),
-            jax.tree_map(lambda x, y: x - y, initial_params, new_params)
-        )
-        assert param_diff_sq_sum > 1e-12, "Parameters did not change after optimizer step."
-
-        # 7. Verify KFAC Factor Updates (EMA)
-        assert len(new_kfac_state.layers) == len(original_kfac_state.layers)
-        num_linear_layers_in_model = len(_linear_layers(model))
-        assert len(new_kfac_state.layers) == num_linear_layers_in_model
-
-        for i in range(num_linear_layers_in_model):
-            orig_lf = original_kfac_state.layers[i]
-            new_lf = new_kfac_state.layers[i]
-
-            # Initial factors are identity matrices
-            # A_omega: (n, n), B_omega: (m, m)
-            # A_boundary: (n, n), B_boundary: (m, m)
-            # After one step, they should no longer be perfect identity matrices if updates happened.
-            # Check if sum of squared differences from identity is large enough, or from original.
-            
-            # For A_omega
-            diff_A_o = new_lf.A_omega - orig_lf.A_omega # orig_lf.A_omega is jnp.eye(...)
-            assert jnp.sum(diff_A_o**2) > 1e-9, f"A_omega factor for layer {i} did not change significantly."
-            # For B_omega
-            diff_B_o = new_lf.B_omega - orig_lf.B_omega
-            assert jnp.sum(diff_B_o**2) > 1e-9, f"B_omega factor for layer {i} did not change significantly."
-            # For A_boundary
-            diff_A_b = new_lf.A_boundary - orig_lf.A_boundary
-            assert jnp.sum(diff_A_b**2) > 1e-9, f"A_boundary factor for layer {i} did not change significantly."
-            # For B_boundary
-            diff_B_b = new_lf.B_boundary - orig_lf.B_boundary
-            assert jnp.sum(diff_B_b**2) > 1e-9, f"B_boundary factor for layer {i} did not change significantly."
-
-        # 8. Verify KFAC* Momentum Update
-        for i in range(num_linear_layers_in_model):
-            orig_lf = original_kfac_state.layers[i] # mw, mb are zeros initially
-            new_lf = new_kfac_state.layers[i]
-            
-            # mw should change from zero
-            assert jnp.sum(new_lf.mw**2) > 1e-12, f"Momentum mw for layer {i} did not change from zero."
-            # mb should change from zero
-            assert jnp.sum(new_lf.mb**2) > 1e-12, f"Momentum mb for layer {i} did not change from zero."
-            
-            # Also check they are different from original (which were zeros)
-            chex.assert_trees_all_close(new_lf.mw, orig_lf.mw, inverted=True, atol=1e-9, rtol=1e-9)
-            chex.assert_trees_all_close(new_lf.mb, orig_lf.mb, inverted=True, atol=1e-9, rtol=1e-9)
-
-
-        # Verify Step Increment (as per current code, step is incremented early for KFAC* logic)
-        assert new_kfac_state.step == original_kfac_state.step + 1
+class TestPINNKFACStepIntegration:
+    @pytest.mark.parametrize("variant", ["kfac_star", "kfac_standard"])
+    def test_step_runs_and_updates(self, variant):
+        global key; key_model, key_data = jr.split(key, 2)
+        model, initial_params_tree, _ = get_test_model_and_params(key_model, in_f=1, out_f=1, num_layers=1)
+        optimizer = PINNKFAC(update_variant=variant, use_line_search=False, lr=0.01) 
+        opt_state = optimizer.init(model)
+        interior = jr.normal(key_data, (5,1)); boundary = jr.normal(key_data, (2,1))
+        def rhs_fn(x): return jnp.zeros(x.shape[0])
+        def bc_fn(x): return jnp.zeros(x.shape[0])
+        new_model, new_opt_state = optimizer.step(model, rhs_fn, bc_fn, interior, boundary, opt_state)
+        new_params_tree, _ = eqx.partition(new_model, eqx.is_array)
+        param_diff = tree_dot(jax.tree_map(lambda x,y: x-y, initial_params_tree, new_params_tree),
+                              jax.tree_map(lambda x,y: x-y, initial_params_tree, new_params_tree))
+        assert param_diff > 1e-12
+        assert new_opt_state.step == opt_state.step + 1
+        for i in range(len(new_opt_state.layers)):
+            lf_new = new_opt_state.layers[i]; lf_init = opt_state.layers[i]
+            assert jnp.sum((lf_new.A_omega - lf_init.A_omega)**2) > 1e-9 
+            assert jnp.sum((lf_new.B_omega - lf_init.B_omega)**2) > 1e-9
+            assert jnp.sum(lf_new.prev_update_w**2) > 1e-12 
+            assert jnp.sum(lf_new.prev_update_b**2) > 1e-12
+            assert jnp.all(jnp.isfinite(lf_new.A_omega)) and jnp.all(jnp.isfinite(lf_new.B_omega))
+            assert jnp.all(jnp.isfinite(lf_new.prev_update_w)) and jnp.all(jnp.isfinite(lf_new.prev_update_b))
