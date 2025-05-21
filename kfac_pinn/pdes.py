@@ -26,6 +26,30 @@ def laplacian(model: Callable[[jnp.ndarray], jnp.ndarray], x: jnp.ndarray) -> jn
     return jax.vmap(single_point)(x) if x.ndim > 1 else single_point(x)
 
 
+def forward_laplacian(model: Callable[[jnp.ndarray], jnp.ndarray], x: jnp.ndarray) -> jnp.ndarray:
+    """Laplacian via forward-mode AD.
+
+    This function computes the trace of the Hessian using nested JVPs, which
+    follows the "forward Laplacian" approach described in the accompanying
+    paper. It avoids constructing the full Hessian explicitly and instead
+    propagates directional derivatives for each coordinate.
+    """
+
+    def single_point(xx):
+        grad_fn = jax.grad(lambda y: jnp.sum(model(y)))
+
+        def second(e):
+            _, out = jax.jvp(grad_fn, (xx,), (e,))
+            return out
+
+        dim = xx.shape[0]
+        basis = jnp.eye(dim)
+        second_cols = jax.vmap(second)(basis)
+        return jnp.sum(second_cols)
+
+    return jax.vmap(single_point)(x) if x.ndim > 1 else single_point(x)
+
+
 def sample_interior(key: jax.random.PRNGKey, domain_min: jnp.ndarray, domain_max: jnp.ndarray, num: int) -> jnp.ndarray:
     """Sample ``num`` points uniformly from the interior of a hyper-rectangle."""
     dim = domain_min.shape[0]

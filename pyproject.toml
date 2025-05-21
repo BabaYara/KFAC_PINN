@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kfac_pinn"
-version = "0.2.0"
+version = "0.3.0"
 description = "KFAC optimizer utilities for Physics-Informed Neural Networks"
 readme = "README.md"
 requires-python = ">=3.9"

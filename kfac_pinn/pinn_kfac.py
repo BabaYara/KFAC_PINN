@@ -22,7 +22,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from .pdes import laplacian
+from .pdes import forward_laplacian
 
 
 class LayerFactors(NamedTuple):
@@ -92,7 +92,7 @@ class PINNKFAC(eqx.Module):
 
         def interior_loss(p):
             m = eqx.combine(static, p)
-            lap = jax.vmap(lambda x: laplacian(m, x[None, :]))(interior)
+            lap = jax.vmap(lambda x: forward_laplacian(m, x[None, :]))(interior)
             res = lap.squeeze() - rhs_fn(interior)
             return 0.5 * jnp.mean(res**2)
 
@@ -214,7 +214,7 @@ def _factor_terms(model, params, pts, fn, interior: bool):
     m = eqx.combine(eqx.partition(model, eqx.is_array)[1], params)
     y, acts, pre, phi = _forward_cache(m, pts)
     if interior:
-        lap = jax.vmap(lambda x: laplacian(m, x[None, :]))(pts).squeeze()
+        lap = jax.vmap(lambda x: forward_laplacian(m, x[None, :]))(pts).squeeze()
         res = lap - fn(pts)
     else:
         res = y.squeeze() - fn(pts)
