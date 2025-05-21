@@ -36,7 +36,22 @@ class KFACState(NamedTuple):
 
 
 class KFAC(eqx.Module):
-    """Kronecker-Factored Approximate Curvature optimizer."""
+    """
+    .. warning::
+        This is a basic, generic KFAC optimizer implementation.
+        It is **NOT** intended or suitable for Physics-Informed Neural Networks (PINNs)
+        that involve differential operators. This implementation does not handle
+        the specific requirements for such problems, such as augmented state
+        propagation for derivative tracking or separate Kronecker factors for
+        PDE residual and boundary condition terms.
+
+        For PINN applications requiring KFAC, please use the `PINNKFAC` class
+        located in `kfac_pinn.pinn_kfac.py`. The `PINNKFAC` optimizer is
+        specifically designed according to the relevant literature for these
+        use cases (e.g., as described in Dangel et al., 2024, "KFAC for PINNs").
+
+    Kronecker-Factored Approximate Curvature optimizer.
+    """
 
     lr: float = 1e-3
     damping: float = 1e-3
