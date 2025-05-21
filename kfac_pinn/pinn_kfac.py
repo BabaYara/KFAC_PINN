@@ -8,10 +8,12 @@ Kronecker factors for the PDE operator term and the boundary term.
 
 The optimiser is intentionally written with clarity in mind. It currently
 supports sequential MLP models composed of ``equinox.nn.Linear`` layers
-and activation functions.  The implementation should be considered an
-initial version -- several parts of the algorithm such as the forward
-Laplacian propagation are simplified.  Nevertheless, all four Kronecker
-factors are tracked and used to precondition gradients.
+and activation functions. The augmented state propagation (e.g., for value,
+gradient, and Laplacian components) is implemented directly for efficiency
+with common second-order PDEs. For arbitrary PDE operators, this would involve
+generalizing the augmented state and using general Taylor-mode AD, as detailed
+in the referenced papers. Nevertheless, all four Kronecker factors are tracked
+and used to precondition gradients.
 
 """
 from __future__ import annotations
@@ -22,11 +24,17 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from .pdes import forward_laplacian
-
 
 # Augmented state for propagating (value, spatial_derivatives, laplacian)
 class AugmentedState(NamedTuple):
+    """
+    Represents the augmented state propagated through the network.
+    Its current structure (value, spatial_derivatives, laplacian) is specialized
+    for PDEs requiring the Laplacian and first-order spatial derivatives.
+    For general PDEs (as per Zeinhofer et al. Sec 3.3), this state would
+    need to hold all S Taylor coefficients, and propagation would use
+    general Taylor-mode Automatic Differentiation (AD) rules.
+    """
     value: jnp.ndarray  # Batched: (batch, features)
     spatial_derivatives: List[jnp.ndarray] # List of d arrays, each (batch, features)
     laplacian: jnp.ndarray # Batched: (batch, features)
@@ -88,7 +96,11 @@ class AugmentedState(NamedTuple):
         return 1 + len(self.spatial_derivatives) + 1
 
 def _propagate_linear_augmented(aug_state: AugmentedState, layer: eqx.nn.Linear) -> AugmentedState:
-    """Propagates AugmentedState through an eqx.nn.Linear layer."""
+    """
+    Propagates AugmentedState through an eqx.nn.Linear layer.
+    This implementation is specialized for an AugmentedState with (value, spatial_derivatives, laplacian).
+    A general version would propagate all S Taylor coefficients using Taylor-mode AD rules for linear layers.
+    """
     # Bias only affects the 'value' component. Derivatives of bias are zero.
     new_value = aug_state.value @ layer.weight.T + layer.bias
     # Propagate each spatial derivative component
@@ -106,6 +118,9 @@ def _propagate_activation_augmented(
     """
     Propagates AugmentedState through an element-wise activation function.
     Assumes activation_fn operates element-wise on `aug_state_pre_activation.value`.
+    This implementation is specialized for an AugmentedState with (value, spatial_derivatives, laplacian)
+    and uses specific propagation rules (e.g., Faà di Bruno's formula for Laplacian).
+    A general version would propagate all S Taylor coefficients using general Taylor-mode AD rules for activations.
     """
     s_val = aug_state_pre_activation.value # (batch, features_in)
     s_spatial_derivatives = aug_state_pre_activation.spatial_derivatives # List of d arrays, each (batch, features_in)
@@ -154,7 +169,6 @@ class PINNKFAC(eqx.Module):
     damping_boundary: float = 1e-3
     damping_kfac_star_model: float = 1e-3
     decay: float = 0.95
-    momentum: float = 0.9 # Note: KFAC* uses its own momentum, this might be vestigial for factor accumulation if not KFAC*
 
     def init(self, model: eqx.Module) -> PINNKFACState:
         factors: List[LayerFactors] = []
@@ -468,6 +482,47 @@ class PINNKFAC(eqx.Module):
 # Helpers
 # ----------------------------------------------------------------------
 
+def _get_activation_derivatives(
+    activation_fn: Callable, 
+    layer_description: str
+) -> Tuple[Callable, Callable, Callable]:
+    """
+    Computes first and second derivatives of an activation function using jax.grad.
+
+    Args:
+        activation_fn: The activation function.
+        layer_description: A string describing the layer, for error messages.
+
+    Returns:
+        A tuple (activation_fn, grad_fn, grad_grad_fn).
+
+    Raises:
+        TypeError: If jax.grad fails to compute derivatives, indicating the
+                   function may not be JAX-differentiable.
+    """
+    try:
+        # Try to evaluate the function with a tracer to catch issues early
+        # This helps ensure the function is JAX-traceable with a scalar float.
+        jax.eval_shape(activation_fn, jnp.array(0.0))
+        
+        grad_fn = jax.grad(activation_fn)
+        # Test grad_fn
+        jax.eval_shape(grad_fn, jnp.array(0.0))
+
+        grad_grad_fn = jax.grad(grad_fn)
+        # Test grad_grad_fn
+        jax.eval_shape(grad_grad_fn, jnp.array(0.0))
+        
+        return activation_fn, grad_fn, grad_grad_fn
+    except Exception as e:
+        # Catch a broad range of JAX errors that might occur if fn is not diffable
+        error_message = (
+            f"Failed to compute derivatives for activation function in {layer_description}. "
+            "Please ensure the activation function is JAX-differentiable and element-wise. "
+            f"Underlying error: {e}"
+        )
+        raise TypeError(error_message) from e
+
 def _linear_layers(model: eqx.Module) -> List[eqx.nn.Linear]:
     if not isinstance(model, eqx.nn.Sequential):
         raise ValueError("Only Sequential models supported")
@@ -483,44 +538,43 @@ def _standard_forward_cache(model: eqx.Module, x: jnp.ndarray):
     
     h = x # Current activation
     
-    _activation_fn_grad_vmap = None
-    _activation_fn_lambda = None
-
-    for layer_obj in model.layers:
-        if isinstance(layer_obj, eqx.nn.Lambda):
-            try:
-                layer_obj.fn(jnp.array(0.0))
-                _activation_fn_lambda = layer_obj.fn
-            except Exception: 
-                 print("Warning: Could not directly get scalar fn for activation grad. Assuming direct grad works.")
-                 _activation_fn_lambda = lambda val: layer_obj.fn(val[None])[0] 
-
-            if _activation_fn_lambda:
-                _activation_fn_grad_vmap = jax.vmap(jax.grad(_activation_fn_lambda))
-            break 
-
     layers = list(model.layers)
-    i = 0
-    while i < len(layers):
-        layer = layers[i]
+    current_layer_index = 0
+    processed_linear_layers = 0 # Counter for naming in errors
+
+    while current_layer_index < len(layers):
+        layer = layers[current_layer_index]
         if isinstance(layer, eqx.nn.Linear):
             acts.append(h) 
             s = layer(h)   
             pre.append(s)
+            processed_linear_layers +=1
             
-            if i + 1 < len(layers) and isinstance(layers[i+1], eqx.nn.Lambda):
-                if _activation_fn_grad_vmap is not None: # Check explicitly for None
-                    phi.append(_activation_fn_grad_vmap(s))
-                else: 
-                    phi.append(jnp.ones_like(s)) 
-                h = layers[i+1](s) 
-                i += 1 
+            # Check if the next layer is a Lambda (activation) layer
+            if current_layer_index + 1 < len(layers) and isinstance(layers[current_layer_index+1], eqx.nn.Lambda):
+                activation_layer_obj = layers[current_layer_index+1]
+                layer_description = f"activation layer {type(activation_layer_obj.fn).__name__} after Linear layer {processed_linear_layers-1}"
+                
+                # Use the helper to get derivatives
+                # _standard_forward_cache only needs the first derivative (grad_fn)
+                _, grad_fn, _ = _get_activation_derivatives(activation_layer_obj.fn, layer_description)
+                
+                vmapped_grad_fn = jax.vmap(grad_fn)
+                phi.append(vmapped_grad_fn(s))
+                
+                h = activation_layer_obj(s) # Apply activation
+                current_layer_index += 1 # Consume the activation layer as well
             else: 
+                # No activation layer follows this linear layer
                 phi.append(jnp.ones_like(s)) 
-                h = s
+                h = s # Output of linear layer is input to next
         else: 
+            # Non-linear layer (could be an activation layer not immediately after a Linear, or other type)
+            # If it's a Lambda layer, it's an activation function.
+            # However, phi is specifically for derivatives of activations *after* linear layers.
+            # So, we just apply the layer.
             h = layer(h) 
-        i += 1
+        current_layer_index += 1
         
     return h, acts, pre, phi
 
@@ -561,74 +615,54 @@ def _augmented_forward_cache(model: eqx.Module, initial_aug_state: AugmentedStat
     aug_pre_acts: List[AugmentedState] = []
     current_aug_state = initial_aug_state
     layers = list(model.layers)
-    i = 0
-    while i < len(layers):
-        layer = layers[i]
+    current_layer_index = 0
+    processed_linear_layers = 0 # For naming in errors
+
+    while current_layer_index < len(layers):
+        layer = layers[current_layer_index]
+        layer_description_prefix = f"layer {current_layer_index} ({type(layer).__name__})"
+
         if isinstance(layer, eqx.nn.Linear):
             aug_input_acts.append(current_aug_state)
             current_aug_state = _propagate_linear_augmented(current_aug_state, layer)
             aug_pre_acts.append(current_aug_state) 
+            processed_linear_layers += 1
 
             # Check if next layer is an activation function
-            if i + 1 < len(layers) and isinstance(layers[i+1], eqx.nn.Lambda):
-                activation_layer_obj = layers[i+1]
+            if current_layer_index + 1 < len(layers) and isinstance(layers[current_layer_index+1], eqx.nn.Lambda):
+                activation_layer_obj = layers[current_layer_index+1]
+                act_fn_raw = activation_layer_obj.fn
+                desc = f"activation layer {type(act_fn_raw).__name__} after Linear layer {processed_linear_layers-1}"
                 
-                # Determine activation function and its derivatives for this specific layer
-                scalar_fn_for_grad = None
-                try: # Test if callable with a scalar
-                    activation_layer_obj.fn(jnp.array(0.0)) 
-                    scalar_fn_for_grad = activation_layer_obj.fn
-                except: 
-                    try: # Test if callable with a (1,)-shaped array, returning scalar
-                        scalar_fn_for_grad = lambda x_scalar: activation_layer_obj.fn(jnp.array([x_scalar]))[0]
-                    except:
-                        pass # Could not determine a scalar version for grad
-
-                if scalar_fn_for_grad:
-                    act_fn_obj_local = activation_layer_obj.fn 
-                    vmap_grad_local = jax.vmap(jax.grad(scalar_fn_for_grad))
-                    vmap_grad_grad_local = jax.vmap(jax.grad(jax.grad(scalar_fn_for_grad)))
-                    
-                    current_aug_state = _propagate_activation_augmented(
-                        current_aug_state, 
-                        act_fn_obj_local, 
-                        vmap_grad_local,
-                        vmap_grad_grad_local
-                    )
-                else:
-                    print(f"Warning: Could not determine scalar activation function for augmented derivatives for layer {i+1} ({activation_layer_obj}). Propagation might be incorrect.")
-                    # Fallback: apply activation to value, zero out derivatives as rule is unknown.
-                    new_val = activation_layer_obj.fn(current_aug_state.value)
-                    spatial_derivs_fallback = [jnp.zeros_like(s_deriv) for s_deriv in current_aug_state.spatial_derivatives]
-                    laplacian_fallback = jnp.zeros_like(current_aug_state.laplacian)
-                    current_aug_state = AugmentedState(new_val, spatial_derivs_fallback, laplacian_fallback)
-                i += 1 # Consume the activation layer
+                act_fn, grad_fn, grad_grad_fn = _get_activation_derivatives(act_fn_raw, desc)
+                
+                vmap_grad_local = jax.vmap(grad_fn)
+                vmap_grad_grad_local = jax.vmap(grad_grad_fn)
+                
+                current_aug_state = _propagate_activation_augmented(
+                    current_aug_state, 
+                    act_fn, # Use the (potentially wrapped) act_fn from helper
+                    vmap_grad_local,
+                    vmap_grad_grad_local
+                )
+                current_layer_index += 1 # Consume the activation layer
             # If no activation layer follows Linear, current_aug_state is already updated by _propagate_linear_augmented
         
         elif isinstance(layer, eqx.nn.Lambda): 
-            # This case handles an activation layer that is NOT immediately after a Linear layer
-            # (e.g., if the model starts with an activation, or multiple activations in a row)
-            # This is unusual for standard MLPs but possible.
-            # Try to propagate similarly, but it might be less meaningful if not after a linear transform.
-            scalar_fn_for_grad = None
-            try: layer.fn(jnp.array(0.0)); scalar_fn_for_grad = layer.fn
-            except: 
-                try: scalar_fn_for_grad = lambda x_scalar: layer.fn(jnp.array([x_scalar]))[0]
-                except: pass
+            act_fn_raw = layer.fn
+            desc = f"standalone activation layer {type(act_fn_raw).__name__} at model index {current_layer_index}"
+            
+            act_fn, grad_fn, grad_grad_fn = _get_activation_derivatives(act_fn_raw, desc)
 
-            if scalar_fn_for_grad:
-                act_fn_obj_local = layer.fn
-                vmap_grad_local = jax.vmap(jax.grad(scalar_fn_for_grad))
-                vmap_grad_grad_local = jax.vmap(jax.grad(jax.grad(scalar_fn_for_grad)))
-                current_aug_state = _propagate_activation_augmented(
-                    current_aug_state, act_fn_obj_local, vmap_grad_local, vmap_grad_grad_local
-                )
-            else:
-                print(f"Warning: Could not determine scalar activation function for augmented derivatives for layer {i} ({layer}). Propagation might be incorrect.")
-                new_val = layer(current_aug_state.value)
-                spatial_derivs_fallback = [jnp.zeros_like(s_deriv) for s_deriv in current_aug_state.spatial_derivatives]
-                laplacian_fallback = jnp.zeros_like(current_aug_state.laplacian)
-                current_aug_state = AugmentedState(new_val, spatial_derivs_fallback, laplacian_fallback)
+            vmap_grad_local = jax.vmap(grad_fn)
+            vmap_grad_grad_local = jax.vmap(grad_grad_fn)
+            
+            current_aug_state = _propagate_activation_augmented(
+                current_aug_state, 
+                act_fn, 
+                vmap_grad_local, 
+                vmap_grad_grad_local
+            )
         
         else: # For non-Linear, non-Lambda layers (e.g. custom layers, Dropout, Identity, etc.)
             # Default behavior: apply layer to value, zero out derivatives and laplacian
@@ -651,12 +685,12 @@ def _augmented_forward_cache(model: eqx.Module, initial_aug_state: AugmentedStat
                 spatial_derivs_zeros = [jnp.zeros_like(s_deriv) for s_deriv in current_aug_state.spatial_derivatives]
                 laplacian_zero = jnp.zeros_like(current_aug_state.laplacian)
             else: # Unexpected shape change (e.g. rank change)
-                print(f"Warning: Layer {i} ({layer}) changed value tensor shape from {original_value_shape} to {new_value_shape} in an unexpected way. Zeroing derivatives based on original feature count.")
+                print(f"Warning: Layer {current_layer_index} ({layer}) changed value tensor shape from {original_value_shape} to {new_value_shape} in an unexpected way. Zeroing derivatives based on original feature count.")
                 spatial_derivs_zeros = [jnp.zeros_like(s_deriv) for s_deriv in current_aug_state.spatial_derivatives]
                 laplacian_zero = jnp.zeros_like(current_aug_state.laplacian)
 
             current_aug_state = AugmentedState(new_val, spatial_derivs_zeros, laplacian_zero)
-        i += 1
+        current_layer_index += 1 # Increment the loop counter for all layer types
         
     return aug_input_acts, aug_pre_acts, current_aug_state
 
@@ -699,24 +733,21 @@ def _augmented_factor_terms(
         
         # Store pre-computed activation derivatives for layers in model_for_grad_b
         # This avoids re-computing them in the loop below.
-        # This map will store: model_layer_index -> (act_fn, grad_fn, grad_grad_fn) or None
+        # This map will store: model_layer_index -> (act_fn, vmap_grad_fn, vmap_grad_grad_fn)
         activation_derivatives_map = {} 
         for k_model_idx, layer_obj_k in enumerate(model_for_grad_b.layers):
             if isinstance(layer_obj_k, eqx.nn.Lambda):
-                scalar_fn_for_grad_k = None
-                try: layer_obj_k.fn(jnp.array(0.0)); scalar_fn_for_grad_k = layer_obj_k.fn
-                except:
-                    try: scalar_fn_for_grad_k = lambda x_scalar_k: layer_obj_k.fn(jnp.array([x_scalar_k]))[0]
-                    except: pass
+                act_fn_raw = layer_obj_k.fn
+                desc = f"activation layer {type(act_fn_raw).__name__} at model index {k_model_idx} (in _compute_interior_loss_from_s_out_list)"
                 
-                if scalar_fn_for_grad_k:
-                    activation_derivatives_map[k_model_idx] = (
-                        layer_obj_k.fn,
-                        jax.vmap(jax.grad(scalar_fn_for_grad_k)),
-                        jax.vmap(jax.grad(jax.grad(scalar_fn_for_grad_k)))
-                    )
-                else:
-                    activation_derivatives_map[k_model_idx] = None
+                # _get_activation_derivatives returns scalar derivative functions
+                act_fn, grad_fn, grad_grad_fn = _get_activation_derivatives(act_fn_raw, desc)
+                
+                activation_derivatives_map[k_model_idx] = (
+                    act_fn, # Original (or wrapped by helper) activation function
+                    jax.vmap(grad_fn),
+                    jax.vmap(grad_grad_fn)
+                )
         
         # current_z_l starts as initial_input_to_network (Z_in_0, i.e. aug_state from coords)
         # We are processing s_out_aug_list_for_grad, where each element is an S_out_l
@@ -742,22 +773,23 @@ def _augmented_factor_terms(
                isinstance(model_for_grad_b.layers[model_idx_of_linear_k + 1], eqx.nn.Lambda):
                 
                 activation_model_idx = model_idx_of_linear_k + 1
+                # act_derivatives will contain (act_fn, vmap_grad_fn, vmap_grad_grad_fn)
+                # or the call to .get() will return None if no activation layer was there.
                 act_derivatives = activation_derivatives_map.get(activation_model_idx)
 
-                if act_derivatives:
+                if act_derivatives: # Ensure there is an activation layer to process
                     act_fn_local, vmap_grad_local, vmap_grad_grad_local = act_derivatives
-                    # current_z_l (which is S_out_l) becomes Z_out_l by passing through activation
                     current_z_l = _propagate_activation_augmented(
                         current_z_l, # This is s_out_k, the pre-activation state
-                        act_fn_local, 
-                        vmap_grad_local, vmap_grad_grad_local
+                        act_fn_local, # The actual activation function callable
+                        vmap_grad_local, 
+                        vmap_grad_grad_local
                     )
-                else: # Fallback if activation derivatives couldn't be determined
-                    print(f"Warning (compute_interior_loss): Could not get activation derivatives for layer {activation_model_idx}. Using value pass-through, zeroing derivatives.")
-                    new_val = model_for_grad_b.layers[activation_model_idx].fn(current_z_l.value)
-                    spatial_derivs_fallback = [jnp.zeros_like(s_deriv) for s_deriv in current_z_l.spatial_derivatives]
-                    laplacian_fallback = jnp.zeros_like(current_z_l.laplacian)
-                    current_z_l = AugmentedState(new_val, spatial_derivs_fallback, laplacian_fallback)
+                # If act_derivatives is None, means no Lambda layer was at activation_model_idx,
+                # so current_z_l (which is S_out_l) correctly passes through.
+                # The _get_activation_derivatives call during map population would have raised
+                # a TypeError if a Lambda layer was present but not differentiable.
+            
             # If no activation layer follows, current_z_l remains S_out_l.
             # This current_z_l then becomes the input for the *next* linear layer's processing
             # in the conceptual forward pass being reconstructed here for differentiation.

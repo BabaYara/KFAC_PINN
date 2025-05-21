@@ -21,11 +21,102 @@ from kfac_pinn.pinn_kfac import (
     compute_gramian_vector_product,
     tree_dot
 )
+# Imports from kfac_pinn (specifically functions to be tested)
+from kfac_pinn.pinn_kfac import _get_activation_derivatives
+
 # If pdes.forward_laplacian is needed, it would be:
 # from kfac_pinn.pdes import forward_laplacian
 
 # Seed for reproducibility in tests
 key = jr.PRNGKey(0)
+
+# Helper function for numerical differentiation for comparison
+def numerical_grad(fn, x, eps=1e-4):
+    return (fn(x + eps) - fn(x - eps)) / (2 * eps)
+
+class TestGetActivationDerivatives:
+    @pytest.mark.parametrize("jax_fn_name, test_points", [
+        ("tanh", [0.0, 0.5, -0.5]),
+        ("relu", [0.0, 0.5, -0.5]), # grad(grad(relu)) is 0 everywhere except undefined at 0 (JAX returns 0 for grad(relu)(0))
+        ("sin", [0.0, jnp.pi/2, -jnp.pi/4]),
+    ])
+    def test_common_activators(self, jax_fn_name, test_points):
+        if jax_fn_name == "tanh":
+            act_fn_orig = jnp.tanh
+        elif jax_fn_name == "relu":
+            act_fn_orig = jax.nn.relu
+        elif jax_fn_name == "sin":
+            act_fn_orig = jnp.sin
+        else:
+            raise ValueError("Unsupported function")
+
+        fn, grad_fn, grad_grad_fn = _get_activation_derivatives(act_fn_orig, f"test_{jax_fn_name}")
+
+        for x_val_float in test_points:
+            x = jnp.array(x_val_float) # Ensure it's a JAX array for differentiation
+            
+            # Check original function
+            chex.assert_trees_all_close(fn(x), act_fn_orig(x), atol=1e-6, err_msg=f"{jax_fn_name}({x})")
+
+            # Check first derivative
+            expected_grad = jax.grad(act_fn_orig)(x)
+            chex.assert_trees_all_close(grad_fn(x), expected_grad, atol=1e-6, err_msg=f"grad_{jax_fn_name}({x})")
+            
+            # Check second derivative
+            expected_grad_grad = jax.grad(jax.grad(act_fn_orig))(x)
+            chex.assert_trees_all_close(grad_grad_fn(x), expected_grad_grad, atol=1e-6, err_msg=f"grad_grad_{jax_fn_name}({x})")
+
+    def test_non_differentiable_function(self):
+        # jnp.sign is complex-valued for derivative, and not JAX-differentiable for floats at 0
+        # _get_activation_derivatives uses jax.eval_shape(..., jnp.array(0.0)) which will fail for jnp.sign
+        # as jax.grad(jnp.sign)(0.0) is nan.
+        fn_non_diff = lambda x: jnp.sign(x) 
+        with pytest.raises(TypeError, match="Failed to compute derivatives"):
+            _get_activation_derivatives(fn_non_diff, "test_non_differentiable_sign")
+
+    def test_custom_non_jax_traceable_function(self):
+        # A function that cannot be traced by JAX due to Python control flow based on abstract value
+        def fn_problematic(x):
+            if x > 0: # This type of condition on an abstract tracer causes ConcretizationTypeError
+                return x * x
+            else:
+                return x
+        
+        with pytest.raises(TypeError, match="Failed to compute derivatives"):
+            # This will likely fail at the jax.eval_shape(activation_fn, ...) stage itself
+            _get_activation_derivatives(fn_problematic, "test_problematic_python_control_flow")
+
+
+    def test_once_not_twice_differentiable(self):
+        # f(x) = x^2 if x >=0, else x^3. f'(x) = 2x if x >=0, else 3x^2. f'(0)=0.
+        # f''(x) = 2 if x > 0, else 6x. f''(0+)=2, f''(0-)=0. Not twice differentiable at 0.
+        # jax.grad(jax.grad(fn))(0.0) might give one of the one-sided derivatives or raise error depending on JAX version/config
+        # The key is that _get_activation_derivatives tries jax.eval_shape on grad_grad_fn at 0.0.
+        # If JAX's grad(grad(fn)) is NaN at 0, or if eval_shape itself detects an issue, it should fail.
+        def fn_once_diff(x_scalar):
+            # Ensure scalar input for this specific definition
+            if not isinstance(x_scalar, jax.Array) or x_scalar.ndim != 0:
+                 raise ValueError("This function is defined for scalar JAX arrays only for this test.")
+            if x_scalar >= 0:
+                return x_scalar**2
+            else:
+                return x_scalar**3
+        
+        # Let's test the behavior of jax.grad(jax.grad(fn_once_diff))(0.0)
+        # grad1 = jax.grad(fn_once_diff)
+        # grad2 = jax.grad(grad1)
+        # print(f"g'(0) = {grad1(jnp.array(0.0))}") # Expected 0
+        # print(f"g''(0) = {grad2(jnp.array(0.0))}") # Expected 2 (JAX often takes the right-hand derivative)
+        # So, this function might actually pass if JAX consistently provides a value for g''(0).
+        # The requirement is to test a function that *fails* _get_activation_derivatives.
+
+        # Let's use a clearer case: f(x) = x|x|. f'(x) = 2|x|. f''(x) = 2sign(x) (problem at 0).
+        fn_abs_times_x = lambda x: x * jnp.abs(x)
+        # jax.grad(jax.grad(fn_abs_times_x))(0.0) is NaN.
+        # So jax.eval_shape(jax.grad(jax.grad(fn_abs_times_x)), jnp.array(0.0)) should fail.
+
+        with pytest.raises(TypeError, match="Failed to compute derivatives"):
+            _get_activation_derivatives(fn_abs_times_x, "test_abs_times_x")
 
 class TestAugmentedState:
     @pytest.mark.parametrize("dim", [1, 2, 3, 5])
@@ -543,9 +634,14 @@ class TestKFACStarHeuristics:
             tree_dot(tree1, tree_diff_shape)
 
 
-    @pytest.mark.parametrize("in_f, out_f", [(2,1), (3,2)])
-    def test_compute_gramian_vector_product_identity_factors(self, in_f, out_f):
-        key_model, key_vec = jr.split(key, 2)
+    @pytest.mark.parametrize("test_case_name, in_f, out_f", [
+        ("identity_factors", 2, 1),
+        ("identity_factors_v2", 3, 2),
+        ("diagonal_factors", 2, 3), # New case for diagonal factors
+        ("diagonal_factors_v2", 3, 2) 
+    ])
+    def test_compute_gramian_vector_product(self, test_case_name, in_f, out_f):
+        key_model, key_vec, key_factors_extra = jr.split(key, 3)
         
         model_layer = eqx.nn.Linear(in_f, out_f, key=key_model)
         model = eqx.nn.Sequential([model_layer])
@@ -554,33 +650,53 @@ class TestKFACStarHeuristics:
         vec_b = jr.normal(key_vec, (out_f,))
         
         # Build vector_tree that matches model structure (params)
-        # Create a dummy params tree and then fill it.
         dummy_params, _ = eqx.partition(model, eqx.is_array)
-        
-        # Path for the single linear layer in the model
         weight_path = lambda tree: tree.layers[0].weight
         bias_path = lambda tree: tree.layers[0].bias
-        
         vector_tree = eqx.tree_at(weight_path, dummy_params, vec_w)
         vector_tree = eqx.tree_at(bias_path, vector_tree, vec_b)
-        
-        identity_factors = LayerFactors(
-            A_omega=jnp.eye(in_f), B_omega=jnp.eye(out_f),
-            A_boundary=jnp.eye(in_f), B_boundary=jnp.eye(out_f),
-            mw=jnp.zeros_like(vec_w), mb=jnp.zeros_like(vec_b)
-        )
-        kfac_factors_layers = tuple([identity_factors])
 
-        gv_parts_list = compute_gramian_vector_product(vector_tree, model, kfac_factors_layers)
+        if "identity_factors" in test_case_name:
+            current_factors = LayerFactors(
+                A_omega=jnp.eye(in_f), B_omega=jnp.eye(out_f),
+                A_boundary=jnp.eye(in_f), B_boundary=jnp.eye(out_f),
+                mw=jnp.zeros_like(vec_w), mb=jnp.zeros_like(vec_b)
+            )
+            expected_gv_w = 2 * vec_w # (I V I^T + I V I^T) = V + V = 2V
+            expected_gv_b = 2 * vec_b # (I Vb + I Vb) = 2Vb
+        elif "diagonal_factors" in test_case_name:
+            # Simple diagonal matrices
+            diag_A_o = jr.uniform(key_factors_extra, (in_f,), minval=0.5, maxval=2.0)
+            diag_B_o = jr.uniform(key_factors_extra, (out_f,), minval=0.5, maxval=2.0)
+            diag_A_b = jr.uniform(key_factors_extra, (in_f,), minval=0.1, maxval=0.5)
+            diag_B_b = jr.uniform(key_factors_extra, (out_f,), minval=0.1, maxval=0.5)
+            
+            A_o = jnp.diag(diag_A_o)
+            B_o = jnp.diag(diag_B_o)
+            A_b = jnp.diag(diag_A_b)
+            B_b = jnp.diag(diag_B_b)
+            
+            current_factors = LayerFactors(
+                A_omega=A_o, B_omega=B_o,
+                A_boundary=A_b, B_boundary=B_b,
+                mw=jnp.zeros_like(vec_w), mb=jnp.zeros_like(vec_b)
+            )
+            # Expected: Gv_w = (B_o @ Vw @ A_o.T) + (B_b @ Vw @ A_b.T)
+            # Since A_o, A_b are diagonal, A.T = A
+            expected_gv_w = (B_o @ vec_w @ A_o) + (B_b @ vec_w @ A_b)
+            # Expected: Gv_b = (B_o @ Vb) + (B_b @ Vb)
+            expected_gv_b = (B_o @ vec_b) + (B_b @ vec_b)
+        else:
+            raise ValueError(f"Unknown test case: {test_case_name}")
+
+        kfac_factors_layers_tuple = tuple([current_factors])
+        gv_parts_list = compute_gramian_vector_product(vector_tree, model, kfac_factors_layers_tuple)
         
         assert len(gv_parts_list) == 1
         gv_part = gv_parts_list[0]
-
-        expected_gv_w = 2 * vec_w # (I V I^T + I V I^T) = V + V = 2V
-        expected_gv_b = 2 * vec_b # (I Vb + I Vb) = 2Vb
         
-        chex.assert_trees_all_close(gv_part['weight'], expected_gv_w, atol=1e-6)
-        chex.assert_trees_all_close(gv_part['bias'], expected_gv_b, atol=1e-6)
+        chex.assert_trees_all_close(gv_part['weight'], expected_gv_w, atol=1e-5, rtol=1e-5) # Increased tolerance for non-identity
+        chex.assert_trees_all_close(gv_part['bias'], expected_gv_b, atol=1e-5, rtol=1e-5)
 
     def test_kfac_star_solver_first_step(self):
         Delta_grad_dot = -0.5 
@@ -660,3 +776,117 @@ class TestKFACStarHeuristics:
         
         assert jnp.isclose(alpha_star_calc, expected_alpha_star_fallback, atol=1e-7)
         assert jnp.isclose(mu_star_calc, expected_mu_star_fallback, atol=1e-7)
+
+
+class TestPINNKFACStep:
+    @pytest.mark.parametrize("model_type", ["simple_linear", "one_hidden_layer"])
+    def test_step_updates_params_and_factors(self, model_type):
+        key_main = jr.PRNGKey(123)
+        key_model_init, key_opt_init, key_data = jr.split(key_main, 3)
+
+        # 1. Setup Model
+        if model_type == "simple_linear":
+            model = eqx.nn.Sequential([eqx.nn.Linear(1, 1, key=key_model_init)])
+        elif model_type == "one_hidden_layer":
+            k1, k2 = jr.split(key_model_init)
+            model = eqx.nn.Sequential([
+                eqx.nn.Linear(1, 2, key=k1), 
+                eqx.nn.Lambda(jnp.tanh), 
+                eqx.nn.Linear(2, 1, key=k2)
+            ])
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+
+        initial_params, initial_static = eqx.partition(model, eqx.is_array)
+
+        # 2. Define Dummy Loss Components
+        # rhs_fn output matches model's final layer output features (1 in this case)
+        # and expects coords (batch, dim_of_coords=1)
+        def rhs_fn_dummy(coords): # Laplacian target
+            return jnp.sum(coords * 0.1, axis=1) # Return (batch,)
+
+        def bc_fn_dummy(coords): # Boundary value target
+            return jnp.sum(coords * 0.2, axis=1) # Return (batch,)
+
+        # 3. Prepare Dummy Data
+        interior_coords = jr.uniform(key_data, (10, 1), minval=0.1, maxval=0.9) # (batch, dim_of_coords=1)
+        boundary_coords = jnp.array([[0.0], [1.0]]) # (batch, dim_of_coords=1)
+
+        # 4. Initialize Optimizer and State
+        optimizer = PINNKFAC(
+            lr=1e-3, # Not used by KFAC* directly for param update step size
+            damping_omega=1e-2, 
+            damping_boundary=1e-2, 
+            damping_kfac_star_model=1e-2, 
+            decay=0.95
+        )
+        
+        # Store original model and KFAC state (factors are initialized to I or 0)
+        original_model = model 
+        original_kfac_state = optimizer.init(original_model)
+
+        # 5. Execute optimizer.step
+        # Ensure no JIT compilation issues by running it once if needed, or just test as is.
+        # The functions inside step are complex, so direct JIT might be slow for first run.
+        # For testing, direct execution is fine.
+        new_model, new_kfac_state = optimizer.step(
+            original_model, rhs_fn_dummy, bc_fn_dummy, 
+            interior_coords, boundary_coords, original_kfac_state
+        )
+
+        # 6. Verify Parameter Updates
+        new_params, _ = eqx.partition(new_model, eqx.is_array)
+        
+        # Check that parameters are different.
+        # Using tree_dot to check for non-zero difference.
+        param_diff_sq_sum = tree_dot(
+            jax.tree_map(lambda x, y: x - y, initial_params, new_params),
+            jax.tree_map(lambda x, y: x - y, initial_params, new_params)
+        )
+        assert param_diff_sq_sum > 1e-12, "Parameters did not change after optimizer step."
+
+        # 7. Verify KFAC Factor Updates (EMA)
+        assert len(new_kfac_state.layers) == len(original_kfac_state.layers)
+        num_linear_layers_in_model = len(_linear_layers(model))
+        assert len(new_kfac_state.layers) == num_linear_layers_in_model
+
+        for i in range(num_linear_layers_in_model):
+            orig_lf = original_kfac_state.layers[i]
+            new_lf = new_kfac_state.layers[i]
+
+            # Initial factors are identity matrices
+            # A_omega: (n, n), B_omega: (m, m)
+            # A_boundary: (n, n), B_boundary: (m, m)
+            # After one step, they should no longer be perfect identity matrices if updates happened.
+            # Check if sum of squared differences from identity is large enough, or from original.
+            
+            # For A_omega
+            diff_A_o = new_lf.A_omega - orig_lf.A_omega # orig_lf.A_omega is jnp.eye(...)
+            assert jnp.sum(diff_A_o**2) > 1e-9, f"A_omega factor for layer {i} did not change significantly."
+            # For B_omega
+            diff_B_o = new_lf.B_omega - orig_lf.B_omega
+            assert jnp.sum(diff_B_o**2) > 1e-9, f"B_omega factor for layer {i} did not change significantly."
+            # For A_boundary
+            diff_A_b = new_lf.A_boundary - orig_lf.A_boundary
+            assert jnp.sum(diff_A_b**2) > 1e-9, f"A_boundary factor for layer {i} did not change significantly."
+            # For B_boundary
+            diff_B_b = new_lf.B_boundary - orig_lf.B_boundary
+            assert jnp.sum(diff_B_b**2) > 1e-9, f"B_boundary factor for layer {i} did not change significantly."
+
+        # 8. Verify KFAC* Momentum Update
+        for i in range(num_linear_layers_in_model):
+            orig_lf = original_kfac_state.layers[i] # mw, mb are zeros initially
+            new_lf = new_kfac_state.layers[i]
+            
+            # mw should change from zero
+            assert jnp.sum(new_lf.mw**2) > 1e-12, f"Momentum mw for layer {i} did not change from zero."
+            # mb should change from zero
+            assert jnp.sum(new_lf.mb**2) > 1e-12, f"Momentum mb for layer {i} did not change from zero."
+            
+            # Also check they are different from original (which were zeros)
+            chex.assert_trees_all_close(new_lf.mw, orig_lf.mw, inverted=True, atol=1e-9, rtol=1e-9)
+            chex.assert_trees_all_close(new_lf.mb, orig_lf.mb, inverted=True, atol=1e-9, rtol=1e-9)
+
+
+        # Verify Step Increment (as per current code, step is incremented early for KFAC* logic)
+        assert new_kfac_state.step == original_kfac_state.step + 1
