@@ -123,50 +123,54 @@ class PINNKFAC(eqx.Module):
             )
         state = PINNKFACState(step=state.step + 1, layers=tuple(new_layers))
 
-        precond_grads, new_layers = [], []
-        g_params = grads
+        updates = []
+        new_layers = []
+        lin_indices = [i for i, l in enumerate(model.layers) if isinstance(l, eqx.nn.Linear)]
         layer_idx = len(state.layers) - 1
-        for i in reversed(range(len(model.layers))):
+        for i in reversed(lin_indices):
             layer = model.layers[i]
-            if isinstance(layer, eqx.nn.Linear):
-                lf = state.layers[layer_idx]
-                Aw = lf.A_omega + self.damping * jnp.eye(lf.A_omega.shape[0])
-                Gw = lf.B_omega + self.damping * jnp.eye(lf.B_omega.shape[0])
-                Aw_b = lf.A_boundary + self.damping * jnp.eye(lf.A_boundary.shape[0])
-                Gw_b = lf.B_boundary + self.damping * jnp.eye(lf.B_boundary.shape[0])
+            lf = state.layers[layer_idx]
+            Aw = lf.A_omega + self.damping * jnp.eye(lf.A_omega.shape[0])
+            Gw = lf.B_omega + self.damping * jnp.eye(lf.B_omega.shape[0])
+            Aw_b = lf.A_boundary + self.damping * jnp.eye(lf.A_boundary.shape[0])
+            Gw_b = lf.B_boundary + self.damping * jnp.eye(lf.B_boundary.shape[0])
 
-                # Inverse of sum of Kronecker products via eigen decomposition
-                eig_A, UA = jnp.linalg.eigh(Aw)
-                eig_G, UG = jnp.linalg.eigh(Gw)
-                eig_Ab, UAb = jnp.linalg.eigh(Aw_b)
-                eig_Gb, UGb = jnp.linalg.eigh(Gw_b)
+            eig_A, UA = jnp.linalg.eigh(Aw)
+            eig_G, UG = jnp.linalg.eigh(Gw)
+            eig_Ab, UAb = jnp.linalg.eigh(Aw_b)
+            eig_Gb, UGb = jnp.linalg.eigh(Gw_b)
 
-                # Precondition weight gradient
-                gw = g_params.layers[i].weight
-                gb = g_params.layers[i].bias
+            gw = grads.layers[i].weight
+            gb = grads.layers[i].bias
 
-                gw = UA.T @ gw @ UG
-                gw = gw / (eig_A[:, None] * eig_G[None, :] + eig_Ab[:, None] * eig_Gb[None, :])
-                gw = UA @ gw @ UG.T
+            gw = UA.T @ gw @ UG
+            gw = gw / (eig_A[:, None] * eig_G[None, :] + eig_Ab[:, None] * eig_Gb[None, :])
+            gw = UA @ gw @ UG.T
 
-                gb = UG.T @ gb
-                gb = gb / (eig_G + eig_Gb)
-                gb = UG @ gb
+            gb = UG.T @ gb
+            gb = gb / (eig_G + eig_Gb)
+            gb = UG @ gb
 
-                mw = self.momentum * lf.mw + gw
-                mb = self.momentum * lf.mb + gb
+            mw = self.momentum * lf.mw + gw
+            mb = self.momentum * lf.mb + gb
 
-                new_w = layer.weight - self.lr * mw
-                new_b = layer.bias - self.lr * mb
+            updates.insert(0, (mw, mb))
+            new_layers.insert(0, LayerFactors(lf.A_omega, lf.B_omega, lf.A_boundary, lf.B_boundary, mw, mb))
+            layer_idx -= 1
 
-                params = eqx.tree_at(lambda p, i=i: p.layers[i].weight, params, new_w)
-                params = eqx.tree_at(lambda p, i=i: p.layers[i].bias, params, new_b)
+        def apply_updates(p, alpha):
+            for idx, (mw, mb) in zip(lin_indices, updates):
+                w = p.layers[idx].weight - alpha * mw
+                b = p.layers[idx].bias - alpha * mb
+                p = eqx.tree_at(lambda q, i=idx: q.layers[i].weight, p, w)
+                p = eqx.tree_at(lambda q, i=idx: q.layers[i].bias, p, b)
+            return p
 
-                new_layers.insert(
-                    0,
-                    LayerFactors(lf.A_omega, lf.B_omega, lf.A_boundary, lf.B_boundary, mw, mb),
-                )
-                layer_idx -= 1
+        alphas = self.lr * (2.0 ** jnp.arange(0, -5, -1))
+        losses = jax.vmap(lambda a: loss_fn(apply_updates(params, a)))(alphas)
+        best_alpha = alphas[jnp.argmin(losses)]
+        params = apply_updates(params, best_alpha)
+
         state = PINNKFACState(step=state.step, layers=tuple(new_layers))
         new_model = eqx.combine(static, params)
         return new_model, state
