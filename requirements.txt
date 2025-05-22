@@ -4,3 +4,5 @@ equinox
 numpy
 matplotlib
 jupyter
+papermill
+optax

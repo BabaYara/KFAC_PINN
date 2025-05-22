@@ -86,9 +86,9 @@ class KFAC(eqx.Module):
             m = eqx.combine(static, p)
             return _forward_with_cache(m, x)
 
-        (pred, acts, phi_primes), param_grads = jax.value_and_grad(forward, has_aux=True)(
-            params
-        )
+        value_and_aux, param_grads = jax.value_and_grad(forward, has_aux=True)(params)
+        pred, aux_data = value_and_aux
+        acts, phi_primes = aux_data
 
         loss = loss_fn(eqx.combine(static, params), batch)
         grad_out = jax.grad(lambda y: loss_fn(eqx.combine(static, params), (y, *extra)))(pred)

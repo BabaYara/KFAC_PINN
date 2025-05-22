@@ -32,6 +32,7 @@ from typing import Callable, List, NamedTuple, Tuple, Any
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jax import tree_util
 
 
 class AugmentedState(NamedTuple):
@@ -501,10 +502,12 @@ class PINNKFAC(eqx.Module):
         # Solve the 2x2 system for (alpha_star, mu_star)
         if current_kfac_factors_state.step == 1: # First optimization step
             mu_star = 0.0
-            if jnp.abs(quad_coeff_alpha) < 1e-8: 
-                alpha_star = 0.0 
-            else:
-                alpha_star = linear_coeff_alpha / quad_coeff_alpha
+            alpha_star = jax.lax.cond(
+                jnp.abs(quad_coeff_alpha) < 1e-8,
+                lambda _: 0.0,  # True branch
+                lambda _: linear_coeff_alpha / quad_coeff_alpha,  # False branch
+                None # Operand for lambda functions
+            )
         else:
             M = jnp.array([[quad_coeff_alpha, quad_coeff_alpha_mu],
                            [quad_coeff_alpha_mu, quad_coeff_mu]])
@@ -514,19 +517,26 @@ class PINNKFAC(eqx.Module):
                 solution = jnp.linalg.solve(M + solver_damping * jnp.eye(2), b_vec)
                 alpha_star, mu_star = solution[0], solution[1]
             except jnp.linalg.LinAlgError:
+                # This part also needs to be JAX-traceable if it's to be JITted.
+                # For now, the print will only work in non-JIT or if the error is concrete at trace time.
                 print("Warning: KFAC* 2x2 system solve failed. Using simplified update.")
-                if jnp.abs(quad_coeff_alpha) < 1e-8: alpha_star = 0.0
-                else: alpha_star = linear_coeff_alpha / quad_coeff_alpha
+                # Replicating the simplified update logic using jax.lax.cond for alpha_star
+                alpha_star = jax.lax.cond(
+                    jnp.abs(quad_coeff_alpha) < 1e-8,
+                    lambda _: 0.0,
+                    lambda _: linear_coeff_alpha / quad_coeff_alpha,
+                    None
+                )
                 mu_star = 0.0 
 
         # Compute the final update direction for KFAC*
-        kfac_star_update_tree = jax.tree_map(
+        kfac_star_update_tree = tree_util.tree_map(
             lambda delta, prev_delta: alpha_star * delta + mu_star * prev_delta,
             current_preconditioned_delta_tree,
             previous_update_tree
         )
         # Apply update to parameters
-        final_params_pytree = jax.tree_map(lambda p, u: p - u, params, kfac_star_update_tree)
+        final_params_pytree = tree_util.tree_map(lambda p, u: p - u, params, kfac_star_update_tree)
 
         # Store kfac_star_update_tree (which is delta_t for this step) as prev_update_w/b
         new_kfac_state_layers_list = []
@@ -579,7 +589,7 @@ class PINNKFAC(eqx.Module):
             (with prev_update_w/b updated to $\delta_t$).
         """
         # Momentum step
-        hat_delta_t_tree = jax.tree_map(
+        hat_delta_t_tree = tree_util.tree_map(
             lambda prev_delta, current_delta: self.momentum_coeff * prev_delta + current_delta,
             previous_update_tree,
             current_preconditioned_delta_tree 
@@ -589,7 +599,7 @@ class PINNKFAC(eqx.Module):
         if self.use_line_search:
             # Line search for alpha_star (effective learning rate)
             def compute_total_loss_at_perturbed_params(alpha_lr_val, base_params_tree, update_direction_tree_ls):
-                perturbed_params_tree = jax.tree_map(
+                perturbed_params_tree = tree_util.tree_map(
                     lambda p, d: p - alpha_lr_val * d, base_params_tree, update_direction_tree_ls
                 )
                 return loss_fn_for_line_search(perturbed_params_tree)
@@ -603,13 +613,13 @@ class PINNKFAC(eqx.Module):
             )
             alpha_star_idx = jnp.argmin(all_losses)
             alpha_star = self.line_search_grid_coeffs[alpha_star_idx]
-            actual_update_to_apply = jax.tree_map(lambda d: alpha_star * d, hat_delta_t_tree)
+            actual_update_to_apply = tree_util.tree_map(lambda d: alpha_star * d, hat_delta_t_tree)
         else:
             # No line search, use fixed learning rate self.lr
-            actual_update_to_apply = jax.tree_map(lambda d: self.lr * d, hat_delta_t_tree)
+            actual_update_to_apply = tree_util.tree_map(lambda d: self.lr * d, hat_delta_t_tree)
 
         # Parameter update
-        final_params_pytree = jax.tree_map(
+        final_params_pytree = tree_util.tree_map(
             lambda p, upd: p - upd, params, actual_update_to_apply
         )
 
@@ -755,11 +765,20 @@ class PINNKFAC(eqx.Module):
             gb = current_layer_grads.bias
             
             # Compute (G_damped)^-1 g_t for weights
-            gw_kfac_layer = UA.T @ gw @ UG
-            precond_denominator_w = (eig_A[:, None] * eig_G[None, :]) + \
-                                  (eig_Ab[:, None] * eig_Gb[None, :]) 
-            gw_kfac_layer = gw_kfac_layer / (precond_denominator_w + 1e-12) # Add epsilon for stability
-            gw_kfac_layer = UA @ gw_kfac_layer @ UG.T
+            # gw has shape (out_features, in_features)
+            # UA has shape (in_features, in_features), eig_A has shape (in_features,)
+            # UG has shape (out_features, out_features), eig_G has shape (out_features,)
+            # (Similarly for UAb, eig_Ab, UGb, eig_Gb)
+
+            gw_transformed = UG.T @ gw @ UA  # Shape: (out_features, in_features)
+            
+            denom_omega = eig_G[:, None] * eig_A[None, :]    # Shape: (out_features, in_features)
+            denom_boundary = eig_Gb[:, None] * eig_Ab[None, :] # Shape: (out_features, in_features)
+            precond_denominator_w = denom_omega + denom_boundary
+            
+            gw_scaled = gw_transformed / (precond_denominator_w + 1e-12)
+            
+            gw_kfac_layer = UG @ gw_scaled @ UA.T # Shape: (out_features, in_features)
 
             # Compute (G_damped)^-1 g_t for biases
             gb_kfac_layer = UG.T @ gb 
@@ -772,7 +791,7 @@ class PINNKFAC(eqx.Module):
 
         # Helper to build PyTrees (Delta_t, delta_{t-1}) from lists of layer parts
         def _build_tree_from_parts(parts_list_local, template_params_local, linear_indices_local):
-            zero_params = jax.tree_map(lambda x: jnp.zeros_like(x) if eqx.is_array(x) else x, template_params_local)
+            zero_params = tree_util.tree_map(lambda x: jnp.zeros_like(x) if eqx.is_array(x) else x, template_params_local)
             filled_tree = zero_params
             if len(parts_list_local) != len(linear_indices_local):
                 raise ValueError(f"Parts list length {len(parts_list_local)} != linear indices length {len(linear_indices_local)}")
@@ -852,7 +871,7 @@ def _standard_forward_cache(model: eqx.Module, x: jnp.ndarray):
         layer = layers[current_layer_index]
         if isinstance(layer, eqx.nn.Linear):
             acts.append(h) 
-            s = layer(h)   
+            s = jax.vmap(layer)(h)   # Apply vmap here
             pre.append(s)
             processed_linear_layers +=1
             if current_layer_index + 1 < len(layers) and isinstance(layers[current_layer_index+1], eqx.nn.Lambda):
@@ -1133,7 +1152,7 @@ def compute_gramian_vector_product(
         gv_products_list.append({'weight': final_g_vw_loop, 'bias': final_g_vb_loop})
 
     # Build the output PyTree using the structure of vector_tree as a template
-    output_tree = jax.tree_map(lambda x: jnp.zeros_like(x) if eqx.is_array(x) else x, vector_tree)
+    output_tree = tree_util.tree_map(lambda x: jnp.zeros_like(x) if eqx.is_array(x) else x, vector_tree)
     
     if not (hasattr(vector_tree, "layers") and isinstance(vector_tree.layers, (list, tuple))):
          # This warning or error might be too strict if vector_tree is not a full model PyTree.
